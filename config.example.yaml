@@ -1,0 +1,27 @@
+# OracleSchemaRefresh — example refresh configuration
+# Copy to refresh.yaml and adjust tables/schemas as needed.
+
+source_schema: BACKOFFICE
+target_schema: LDEBURNA
+
+# Tables to refresh. FK parents are auto-discovered and included
+# unless auto_include_fk_parents is false.
+tables:
+  - SUN_LEDGER
+
+# If true, walk the FK graph and pull in any parent tables that
+# SUN_LEDGER depends on (same source schema only).
+auto_include_fk_parents: true
+
+# If true: DROP TABLE CASCADE CONSTRAINTS PURGE then re-CREATE.
+# If false (default): TRUNCATE + INSERT (preserves table structure).
+recreate_tables: false
+
+# per_table: COMMIT after each table's INSERT completes.
+# all_or_nothing: single COMMIT at the very end (note: TRUNCATE
+# is DDL and auto-commits regardless of this setting).
+commit_mode: per_table
+
+# Change to "" to use conventional INSERT (slower but allows
+# concurrent reads during load).
+insert_hint: "/*+ APPEND */"

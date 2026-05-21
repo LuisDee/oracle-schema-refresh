@@ -1,0 +1,315 @@
+"""FK discovery, dependency graph, topological sort, and DDL extraction."""
+from __future__ import annotations
+
+from collections import deque
+from typing import Any
+
+import oracledb
+import structlog
+
+log = structlog.get_logger()
+
+# ORA-31608: object/type/attribute/named not found (no indexes found for table)
+_ORA_NO_OBJECTS = 31608
+
+
+def topological_sort(graph: dict[str, list[str]]) -> list[str]:
+    """Return nodes in dependency order — parents before children.
+
+    Args:
+        graph: Adjacency list where graph[node] = list of parent nodes
+               that *node* depends on.
+
+    Returns:
+        Ordered list with all parents before their dependants.
+
+    Raises:
+        ValueError: If a circular dependency is detected.
+    """
+    # Compute in-degree: number of parents each node has (within this graph)
+    in_degree: dict[str, int] = {n: 0 for n in graph}
+    for node, parents in graph.items():
+        for parent in parents:
+            if parent in in_degree:
+                in_degree[node] += 1
+
+    # Reverse map: parent -> children that depend on it
+    dependents: dict[str, list[str]] = {n: [] for n in graph}
+    for node, parents in graph.items():
+        for parent in parents:
+            if parent in dependents:
+                dependents[parent].append(node)
+
+    # Kahn's algorithm — start with nodes that have no dependencies
+    queue: deque[str] = deque(n for n, deg in in_degree.items() if deg == 0)
+    result: list[str] = []
+
+    while queue:
+        node = queue.popleft()
+        result.append(node)
+        for child in dependents[node]:
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                queue.append(child)
+
+    if len(result) != len(graph):
+        cycle_nodes = [n for n in graph if n not in result]
+        raise ValueError(f"FK cycle detected among tables: {cycle_nodes}")
+
+    return result
+
+
+def table_exists(conn: Any, schema: str, table_name: str) -> bool:
+    """Return True if table_name exists in the given schema."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT table_name FROM all_tables "
+            "WHERE owner = :schema AND table_name = :table_name",
+            schema=schema,
+            table_name=table_name,
+        )
+        return cur.fetchone() is not None
+
+
+def discover_fk_parents(
+    conn: Any,
+    source_schema: str,
+    seed_tables: list[str],
+) -> list[str]:
+    """Walk the FK graph from seed_tables and return the full table set.
+
+    Only includes parent tables that belong to source_schema. Cross-schema
+    FK parents are ignored (the FK DDL will reference them as-is).
+
+    Args:
+        conn: Active oracledb connection.
+        source_schema: Schema owning the seed tables.
+        seed_tables: Initial table list to expand.
+
+    Returns:
+        Deduplicated list of all tables (seeds + discovered parents).
+    """
+    visited: set[str] = set(seed_tables)
+    queue: deque[str] = deque(seed_tables)
+
+    while queue:
+        table = queue.popleft()
+        log.debug("discover_fk_parents", table=table, schema=source_schema)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT rc.table_name AS parent_table,
+                       rc.owner AS parent_schema
+                  FROM all_constraints c
+                  JOIN all_constraints rc
+                    ON c.r_constraint_name = rc.constraint_name
+                   AND c.r_owner = rc.owner
+                 WHERE c.owner = :source_schema
+                   AND c.table_name = :table_name
+                   AND c.constraint_type = 'R'
+                """,
+                source_schema=source_schema,
+                table_name=table,
+            )
+            for parent_table, parent_schema in cur.fetchall():
+                if parent_schema == source_schema and parent_table not in visited:
+                    visited.add(parent_table)
+                    queue.append(parent_table)
+
+    # Preserve seed order, then append discovered parents
+    result: list[str] = list(seed_tables)
+    for t in visited:
+        if t not in seed_tables:
+            result.append(t)
+    return result
+
+
+def build_dependency_graph(
+    conn: Any,
+    source_schema: str,
+    tables: list[str],
+) -> dict[str, list[str]]:
+    """Build an adjacency list: table -> [parent tables it depends on].
+
+    Only edges within the provided tables set are included.
+
+    Args:
+        conn: Active oracledb connection.
+        source_schema: Schema owning the tables.
+        tables: Full table set to build the graph for.
+
+    Returns:
+        Dict mapping each table to its list of FK parent tables.
+    """
+    table_set = set(tables)
+    graph: dict[str, list[str]] = {t: [] for t in tables}
+
+    for table in tables:
+        log.debug("build_dependency_graph", table=table, schema=source_schema)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT rc.table_name AS parent_table,
+                       rc.owner AS parent_schema
+                  FROM all_constraints c
+                  JOIN all_constraints rc
+                    ON c.r_constraint_name = rc.constraint_name
+                   AND c.r_owner = rc.owner
+                 WHERE c.owner = :source_schema
+                   AND c.table_name = :table_name
+                   AND c.constraint_type = 'R'
+                """,
+                source_schema=source_schema,
+                table_name=table,
+            )
+            for parent_table, parent_schema in cur.fetchall():
+                if parent_table in table_set:
+                    graph[table].append(parent_table)
+
+    return graph
+
+
+def _configure_ddl_transforms(cur: Any) -> None:
+    """Set session-level DBMS_METADATA transform parameters."""
+    for param, value in [
+        ("STORAGE", "FALSE"),
+        ("TABLESPACE", "FALSE"),
+        ("SEGMENT_ATTRIBUTES", "FALSE"),
+        ("SQLTERMINATOR", "TRUE"),
+        ("REF_CONSTRAINTS", "FALSE"),
+    ]:
+        cur.execute(
+            f"BEGIN DBMS_METADATA.SET_TRANSFORM_PARAM("
+            f"DBMS_METADATA.SESSION_TRANSFORM,'{param}',{value}); END;"
+        )
+
+
+def get_table_ddl(
+    conn: Any,
+    source_schema: str,
+    table_name: str,
+    target_schema: str,
+) -> str:
+    """Extract CREATE TABLE DDL remapped to target_schema.
+
+    Uses DBMS_METADATA.GET_DDL with session-level transform parameters.
+    Schema name replacement is performed on the returned DDL string.
+
+    Args:
+        conn: Active oracledb connection.
+        source_schema: Schema that owns the table.
+        table_name: Table to extract DDL for.
+        target_schema: Schema name to substitute in the DDL.
+
+    Returns:
+        Remapped DDL string (stripped of leading/trailing whitespace).
+    """
+    with conn.cursor() as cur:
+        _configure_ddl_transforms(cur)
+        cur.execute(
+            "SELECT DBMS_METADATA.GET_DDL('TABLE', :name, :schema) FROM DUAL",
+            name=table_name,
+            schema=source_schema,
+        )
+        row = cur.fetchone()
+        ddl: str = row[0].read()
+
+    # Oracle always quotes schema names in DDL output
+    ddl = ddl.replace(f'"{source_schema}".', f'"{target_schema}".')
+    # Also handle unquoted form (defensive)
+    ddl = ddl.replace(f"{source_schema}.", f"{target_schema}.")
+    # SQLTERMINATOR=TRUE appends a trailing ";" — strip it because
+    # oracledb.execute() does not accept SQL with a semicolon terminator.
+    return ddl.strip().rstrip(";").strip()
+
+
+def get_index_ddl(
+    conn: Any,
+    source_schema: str,
+    table_name: str,
+    target_schema: str,
+) -> list[str]:
+    """Extract CREATE INDEX DDL statements remapped to target_schema.
+
+    Returns an empty list if the table has no indexes (ORA-31608 is handled
+    gracefully rather than raised).
+
+    Args:
+        conn: Active oracledb connection.
+        source_schema: Schema that owns the table.
+        table_name: Table to extract index DDL for.
+        target_schema: Schema name to substitute in the DDL.
+
+    Returns:
+        List of individual CREATE INDEX statements (may be empty).
+    """
+    with conn.cursor() as cur:
+        try:
+            _configure_ddl_transforms(cur)
+            cur.execute(
+                "SELECT DBMS_METADATA.GET_DEPENDENT_DDL('INDEX', :name, :schema) FROM DUAL",
+                name=table_name,
+                schema=source_schema,
+            )
+            row = cur.fetchone()
+            raw: str = row[0].read()
+        except oracledb.DatabaseError as exc:
+            if exc.args and exc.args[0].code == _ORA_NO_OBJECTS:
+                log.debug("get_index_ddl_no_indexes", table=table_name)
+                return []
+            raise
+
+    # Remap schema, split on semicolons into individual statements
+    raw = raw.replace(f'"{source_schema}".', f'"{target_schema}".')
+    raw = raw.replace(f"{source_schema}.", f"{target_schema}.")
+
+    stmts = [s.strip() for s in raw.split(";") if s.strip()]
+    return stmts
+
+
+def get_fk_constraints_on_target(
+    conn: Any,
+    target_schema: str,
+    tables: list[str],
+) -> list[dict[str, str]]:
+    """Return FK constraints on the target schema tables.
+
+    Args:
+        conn: Active oracledb connection.
+        target_schema: Schema to query.
+        tables: Tables to query constraints for.
+
+    Returns:
+        List of dicts with keys: name, table, status.
+    """
+    if not tables:
+        return []
+
+    placeholders = ", ".join(f":t{i}" for i in range(len(tables)))
+    params: dict[str, Any] = {"schema": target_schema}
+    params.update({f"t{i}": t for i, t in enumerate(tables)})
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT constraint_name, table_name, status
+              FROM all_constraints
+             WHERE owner = :schema
+               AND constraint_type = 'R'
+               AND table_name IN ({placeholders})
+            ORDER BY table_name, constraint_name
+            """,
+            **params,
+        )
+        return [
+            {"name": row[0], "table": row[1], "status": row[2]}
+            for row in cur.fetchall()
+        ]
+
+
+def get_table_row_count(conn: Any, schema: str, table_name: str) -> int:
+    """Return the current row count for a table."""
+    with conn.cursor() as cur:
+        cur.execute(f'SELECT COUNT(*) FROM "{schema}"."{table_name}"')  # noqa: S608
+        row = cur.fetchone()
+        return int(row[0])
