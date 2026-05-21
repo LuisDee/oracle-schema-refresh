@@ -10,6 +10,7 @@ import structlog
 
 from oracle_schema_refresh import introspect
 from oracle_schema_refresh.config import OracleConnection, RefreshConfig
+from oracle_schema_refresh.endpoints import Endpoint
 
 log = structlog.get_logger()
 
@@ -70,11 +71,51 @@ class RefreshResult:
 
 
 class RefreshEngine:
-    """Orchestrates the 5-phase idempotent schema refresh."""
+    """Orchestrates the 5-phase idempotent schema refresh.
 
-    def __init__(self, oracle_conn: OracleConnection, config: RefreshConfig) -> None:
-        self._oracle_conn = oracle_conn
+    Accepts either a legacy ``OracleConnection`` (env-loaded credentials) or
+    an :class:`Endpoint`. In both cases the same endpoint is currently used
+    for source and target; Cut 1b will split these.
+    """
+
+    def __init__(
+        self,
+        oracle_conn: OracleConnection | Endpoint,
+        config: RefreshConfig,
+    ) -> None:
+        if isinstance(oracle_conn, Endpoint):
+            endpoint = oracle_conn
+        else:
+            endpoint = Endpoint.from_oracle_connection(oracle_conn)
+        # Same endpoint for source and target today — Cut 1b splits these.
+        self._source: Endpoint = endpoint
+        self._target: Endpoint = endpoint
         self._config = config
+
+    @classmethod
+    def from_endpoints(
+        cls,
+        source: Endpoint,
+        target: Endpoint,
+        config: RefreshConfig,
+    ) -> RefreshEngine:
+        """Construct an engine with distinct source / target endpoints.
+
+        Cut 0 still requires both endpoints to share a DSN — cross-host
+        execution lands in Cut 1b. Passing distinct DSNs today raises
+        ``ValueError`` so callers don't silently get same-instance behaviour
+        when they expect cross-host.
+        """
+        if source.dsn != target.dsn:
+            raise ValueError(
+                "Cross-host endpoints not yet supported (lands in Cut 1b). "
+                f"source.dsn={source.dsn!r} target.dsn={target.dsn!r}"
+            )
+        instance = cls.__new__(cls)
+        instance._source = source
+        instance._target = target
+        instance._config = config
+        return instance
 
     # ------------------------------------------------------------------
     # Public API
@@ -90,12 +131,10 @@ class RefreshEngine:
             RefreshResult with per-table outcomes and totals.
         """
         t0 = time.monotonic()
-        conn = oracledb.connect(
-            user=self._oracle_conn.username,
-            password=self._oracle_conn.password.get_secret_value(),
-            dsn=self._oracle_conn.dsn,
-            tcp_connect_timeout=10,
-        )
+        # Same-instance refresh: source and target are the same endpoint,
+        # one connection handles both. Cut 1b will open a connection per
+        # endpoint and route reads/writes accordingly.
+        conn = self._target.connect()
         try:
             result = self._execute(conn, dry_run=dry_run)
         finally:
