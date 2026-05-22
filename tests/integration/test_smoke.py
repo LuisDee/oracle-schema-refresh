@@ -272,6 +272,51 @@ def test_oracdb_pipeline_end_to_end(
 # ---------------------------------------------------------------------------
 
 
+def test_chunked_staging_strategy_against_real_oracle(
+    oracle_conn: object,
+    fresh_schemas: tuple[str, str],
+    oracle_dsn: tuple[str, str, str],
+) -> None:
+    """End-to-end: explicit ``--strategy chunked_staging`` on a ~10k-row
+    table. Proves the DBMS_PARALLEL_EXECUTE PL/SQL parses, the staging
+    tables get created, chunks get loaded, the merge happens, the
+    staging tables get dropped, and the row counts match."""
+    from pydantic import SecretStr
+
+    from oracle_schema_refresh.config import RefreshConfig
+    from oracle_schema_refresh.endpoints import Endpoint
+    from oracle_schema_refresh.engine import RefreshEngine
+
+    src, tgt = fresh_schemas
+    _populate_source(oracle_conn, src, n_rows=10_000)
+
+    user, password, dsn = oracle_dsn
+    ep = Endpoint(name="x", dsn=dsn, username=user, password=SecretStr(password))
+    cfg = RefreshConfig(
+        source_schema=src,
+        target_schema=tgt,
+        tables=["PEOPLE"],
+        auto_include_fk_parents=False,
+        strategy="chunked_staging",
+        max_parallel=2,
+        max_chunks_per_table=4,
+    )
+    result = RefreshEngine(ep, cfg).run(dry_run=False)
+
+    assert result.success is True
+    assert result.table_results[0].match is True
+    assert result.table_results[0].rows_source == 10_000
+
+    # No staging tables left behind.
+    cur = oracle_conn.cursor()  # type: ignore[attr-defined]
+    cur.execute(
+        "SELECT COUNT(*) FROM all_tables "
+        "WHERE owner = :s AND table_name LIKE 'PEOPLE_STG_%'",
+        s=tgt,
+    )
+    assert cur.fetchone()[0] == 0
+
+
 def test_fk_disable_enable_cycle_around_load(
     oracle_conn: object,
     fresh_schemas: tuple[str, str],

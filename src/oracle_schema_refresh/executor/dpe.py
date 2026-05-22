@@ -1,12 +1,14 @@
 """Wrapper around ``DBMS_PARALLEL_EXECUTE``.
 
-Submits a task that runs N pre-built INSERT statements in parallel,
-one per chunk, on the target session. Waits for completion (or
-failure) before returning.
+The right pattern for "run N independent statements in parallel" is
+**one** ``RUN_TASK`` with a single parametrised template — Oracle
+dispatches the chunks across ``parallel_level`` slaves. A loop over
+chunks would serialise them (``RUN_TASK`` blocks).
 
-The pattern: ``CREATE_TASK`` + ``CREATE_CHUNKS_BY_NUMBER_COL`` (we
-synthesise a chunk-driving query that returns one row per chunk index)
-+ ``RUN_TASK`` + ``DROP_TASK``.
+Implementation: a CASE-on-``:start_id`` PL/SQL block. Each slave gets
+its chunk index, looks up the right INSERT statement, and runs it via
+``EXECUTE IMMEDIATE``. The chunk-driving query feeds
+``(chunk_id, chunk_id)`` for ``chunk_id ∈ [0, N)``.
 """
 from __future__ import annotations
 
@@ -23,65 +25,70 @@ def run_parallel_task(
 ) -> None:
     """Run ``chunk_sqls`` in parallel via DBMS_PARALLEL_EXECUTE.
 
-    Each chunk SQL is one full ``INSERT`` statement — the wrapper does
-    not template ``:start_id`` / ``:end_id`` placeholders, because
-    Cut 2's strategies pre-build per-chunk SQL with ``ORA_HASH(rowid)``
-    bucketing baked in.
+    ``chunk_sqls[i]`` is the full statement to execute for chunk ``i``.
+    Strategies bake all chunk-specific routing (e.g.
+    ``ORA_HASH(ROWID, N-1) = i``) into the SQL itself.
 
-    The chunk-driving query returns ``(idx, idx)`` for ``idx = 0..N-1``,
-    which DBMS_PARALLEL_EXECUTE feeds back into each chunk's
-    ``:start_id`` (== chunk index). Strategies that don't need it just
-    don't reference it.
+    The wrapper:
 
-    Implementation: an anonymous PL/SQL block. Cheaper than three
-    round-trips.
+    * ``CREATE_TASK``
+    * ``CREATE_CHUNKS_BY_SQL`` with one row per chunk index
+    * ``RUN_TASK`` **once** with a CASE template that dispatches on
+      ``:start_id`` to the correct ``EXECUTE IMMEDIATE``
+    * ``DROP_TASK`` on the way out
+
+    Best-effort cleanup of ``task_name`` if any earlier step failed.
     """
+    _ = scn  # currently unused; reserved for AS OF SCN bind in templates
     n = len(chunk_sqls)
     if n == 0:
         return
-    # Build a CASE statement so the parallel-execute task dispatches
-    # to the right chunk SQL based on :start_id.
-    case_arms = "\n".join(
-        f"WHEN {i} THEN q'<{sql}>'" for i, sql in enumerate(chunk_sqls)
-    )
-    chunk_sql_select = f"""
-      SELECT CASE :start_id
-        {case_arms}
-      END
-      FROM dual
-    """
 
+    # Each chunk SQL is wrapped in q'[...]' so embedded single quotes and
+    # newlines survive PL/SQL string parsing. The delimiter is chosen
+    # to be unlikely in INSERT … SELECT SQL.
+    case_arms = "\n        ".join(
+        f"WHEN {i} THEN EXECUTE IMMEDIATE q'[{sql}]';"
+        for i, sql in enumerate(chunk_sqls)
+    )
+
+    # Single PL/SQL block does the full lifecycle. The template under
+    # RUN_TASK is what each slave executes; outer block creates the task,
+    # runs it (blocking until all chunks complete or one errors), and
+    # tears it down. DBMS_PARALLEL_EXECUTE re-raises on chunk failure
+    # after marking chunks FAILED.
     block = f"""
     DECLARE
-      v_stmt CLOB;
+      v_template VARCHAR2(32767) := q'[
+        DECLARE
+          v_idx NUMBER := :start_id;
+        BEGIN
+          CASE v_idx
+            {case_arms}
+          END CASE;
+          COMMIT;
+        END;
+      ]';
     BEGIN
+      BEGIN
+        DBMS_PARALLEL_EXECUTE.DROP_TASK(task_name => '{task_name}');
+      EXCEPTION WHEN OTHERS THEN NULL;
+      END;
       DBMS_PARALLEL_EXECUTE.CREATE_TASK(task_name => '{task_name}');
       DBMS_PARALLEL_EXECUTE.CREATE_CHUNKS_BY_SQL(
-        task_name   => '{task_name}',
-        sql_stmt    => 'SELECT level - 1 AS start_id, level - 1 AS end_id '
-                       'FROM dual CONNECT BY level <= {n}',
-        by_rowid    => FALSE
+        task_name => '{task_name}',
+        sql_stmt  => 'SELECT level - 1 AS start_id, level - 1 AS end_id '
+                     'FROM dual CONNECT BY level <= {n}',
+        by_rowid  => FALSE
       );
-      FOR rec IN (
-        SELECT chunk_id, start_id FROM user_parallel_execute_chunks
-         WHERE task_name = '{task_name}'
-      ) LOOP
-        SELECT CASE rec.start_id
-          {case_arms}
-        END
-          INTO v_stmt FROM dual;
-        DBMS_PARALLEL_EXECUTE.RUN_TASK(
-          task_name      => '{task_name}',
-          sql_stmt       => v_stmt,
-          language_flag  => DBMS_SQL.NATIVE,
-          parallel_level => {parallel_level}
-        );
-      END LOOP;
+      DBMS_PARALLEL_EXECUTE.RUN_TASK(
+        task_name      => '{task_name}',
+        sql_stmt       => v_template,
+        language_flag  => DBMS_SQL.NATIVE,
+        parallel_level => {parallel_level}
+      );
       DBMS_PARALLEL_EXECUTE.DROP_TASK(task_name => '{task_name}');
     END;
     """
     with conn.cursor() as cur:
         cur.execute(block)
-    # Reference unused var so a linter doesn't strip the helper above
-    # in case future refactor needs it.
-    _ = chunk_sql_select
