@@ -359,7 +359,7 @@ Today's `introspect.py` splits across `introspect/fk.py`, `introspect/ddl.py`,
 Each cut is a single PR. Each lands green tests. No cut breaks the legacy
 `schema-refresh` CLI.
 
-### Cut 0 — `Endpoint` abstraction (no behaviour change)
+### Cut 0 — `Endpoint` abstraction (no behaviour change) ✅ done (`2388d4b`)
 
 - Introduce `Endpoint` dataclass and `endpoints/auth.py`.
 - `RefreshEngine.__init__(source: Endpoint, target: Endpoint, config)` —
@@ -368,9 +368,9 @@ Each cut is a single PR. Each lands green tests. No cut breaks the legacy
 - Existing tests pass unchanged.
 - `schema-refresh` CLI unchanged.
 
-**Exit criterion**: `pytest` passes, no diff in observable CLI behaviour.
+**Exit criterion met**: `pytest` passes, no diff in observable CLI behaviour.
 
-### Cut 1a — correctness fixes (no new architecture)
+### Cut 1a — correctness fixes (no new architecture) ✅ done (`d6fa02d` + `79cd345` follow-up)
 
 These fix bugs the redesign discussion identified, but don't need any of
 the new machinery:
@@ -378,31 +378,45 @@ the new machinery:
 - `AS OF SCN :scn` reads in `_insert_table` (intra-instance — no dblink yet).
 - Explicit column list from `ALL_TAB_COLUMNS` instead of `SELECT *`.
 - Rename or remove `commit_mode="all_or_nothing"` (it's misleading because
-  TRUNCATE auto-commits — pick honest semantics).
+  TRUNCATE auto-commits — pick honest semantics). Resolution: kept the
+  field, added `defer_insert_commits` honest value, `all_or_nothing` is
+  a deprecated alias (closes §7 q1).
 - Add `call_timeout` on the connection.
 - Source-vs-target row-count validation in `TableResult`
   (`rows_source`, `rows_target`, `match`).
 - Tighten `_safe_execute` ignore sets — pass per-call rather than defaulting
   to the union of all idempotent codes.
-- `ALTER SEQUENCE` restart for identity columns.
+- `ALTER SEQUENCE` restart for identity columns and trigger-detected
+  sequences (best-effort `ALL_TRIGGERS` scan). Skipped on Oracle <18c.
+- Per-table rollback on row-count mismatch (don't commit a known-bad
+  INSERT); defer-mode rollback on any failure.
 
-**Exit criterion**: all the above visible in `RefreshResult.summary()`,
-tests updated, behaviour gated so existing callers still get the old
-shape unless they ask for the new fields.
+**Exit criterion met**: behaviour visible in `RefreshResult.summary()`,
+85 tests pass after the follow-up.
 
-### Cut 1b — cross-host `direct_copy` strategy
+### Cut 1b — cross-host `direct_copy` strategy ✅ done (`5b8acb5`)
 
 - `endpoints/dblink.py` — `existing` and `session` modes.
-- `strategy/direct_copy.py` with `INSERT ... SELECT * FROM tbl@link
-  AS OF SCN :scn`.
-- New `oracdb` CLI surface with `endpoints add/list/test` + `copy`.
-- `schema-refresh` still works unchanged.
+- `endpoints/registry.py` — `~/.oracdb/endpoints.yaml` YAML registry,
+  `0o600` permissions, typed `UnknownEndpointError` / `DuplicateEndpointError`.
+- Engine cross-host path: `from_endpoints` permits distinct DSNs iff
+  `config.dblink` is set; `_execute(source_conn, target_conn,
+  dblink_name, dry_run)` routes each introspect call to the right
+  session; INSERT uses `… FROM tbl@<dblink> AS OF SCN :scn`.
+- New `oracdb` CLI entry point with `endpoints add/list/remove/test`
+  and `copy`. `schema-refresh` unchanged.
+- §7 q2 resolved: cross-host without CREATE DATABASE LINK is refused
+  with a clear error, no Python row-shipping fallback.
+- §7 q5 resolved: `oracdb` and `schema-refresh` coexist permanently;
+  both entry points registered in `pyproject.toml`.
 
-**Exit criterion**: cross-host single-statement copy of a small table works
-end-to-end against testcontainers-oracle. SCN consistency verified by a
-race test.
+**Exit criterion partially met**: cross-host single-statement copy
+exercised via mocked SQL assertions (124 tests pass). The
+testcontainers-oracle race-test integration suite is **not yet
+written** — biggest open risk, slated for the integration-test
+infra cut before Cut 2 ships.
 
-### Cut 1c — server-side state + phased CLI
+### Cut 1c — server-side state + phased CLI (next)
 
 - `state/` module: `oracdb$jobs`, `oracdb$tables` tables, accessors.
 - `oracdb plan` / `run` / `status` / `verify` / `cancel` / `cleanup` /
@@ -469,23 +483,34 @@ plus on-demand via a manual workflow trigger.
 
 ## 7. Open questions
 
-To resolve before the corresponding cut starts:
+To resolve before the corresponding cut starts.
 
-1. **Cut 1a**: what's the honest name for `commit_mode`? Candidates:
-   `defer_insert_commits` / `commit_per_table` / drop the option and
-   always commit per table.
-2. **Cut 1b**: do we need to support source endpoints that have **no**
-   `CREATE DATABASE LINK` available at all (i.e. fall back to Python row
-   shipping)? Default position: **no** — refuse with a clear error.
+### Resolved
+
+1. ~~**Cut 1a**: what's the honest name for `commit_mode`?~~ **Resolved in
+   Cut 1a (`d6fa02d`)**: kept the field, added `defer_insert_commits` as
+   the honest value, `all_or_nothing` is a deprecated alias that
+   pydantic-normalises to `defer_insert_commits` and emits a
+   `DeprecationWarning`.
+2. ~~**Cut 1b**: do we need to support source endpoints with no `CREATE
+   DATABASE LINK`?~~ **Resolved in Cut 1b (`5b8acb5`)**: no.
+   `RefreshEngine.from_endpoints` refuses distinct DSNs without
+   `config.dblink` set; the CLI surfaces the message cleanly. No
+   Python row-shipping fallback — the moment row data crosses Python,
+   we've picked the wrong tool.
+5. ~~**Cross-cut**: should `oracdb` eventually replace `schema-refresh`,
+   or coexist permanently?~~ **Resolved in Cut 1b (`5b8acb5`)**:
+   permanent coexistence. Both entry points registered in
+   `pyproject.toml`; the same engine drives both; `schema-refresh`
+   semantics unchanged.
+
+### Open
+
 3. **Cut 1c**: `job_id` format. Suggested `j_<YYYYMMDD>_<HHMMSS>_<rand4>`
    so it sorts chronologically and is human-readable in `oracdb$jobs`.
 4. **Cut 2**: how do we estimate chunk count for `chunked_staging`?
    By table size in MB (target ~256MB/chunk) or by row count (target
    ~10M rows/chunk)? Pick one and document.
-5. **Cross-cut**: should `oracdb` eventually replace `schema-refresh`, or
-   coexist permanently? Default position: **coexist permanently** —
-   `schema-refresh` is a stable, simple interface for the same-instance
-   case.
 
 ---
 

@@ -17,11 +17,27 @@ auto_include_fk_parents: true
 # If false (default): TRUNCATE + INSERT (preserves table structure).
 recreate_tables: false
 
-# per_table: COMMIT after each table's INSERT completes.
-# all_or_nothing: single COMMIT at the very end (note: TRUNCATE
-# is DDL and auto-commits regardless of this setting).
+# per_table (default): COMMIT after each table's INSERT iff source and
+#   target row counts match; ROLLBACK that table on mismatch.
+# defer_insert_commits: hold all INSERTs in one transaction, COMMIT at
+#   the end iff every table matched, otherwise ROLLBACK the batch.
+# all_or_nothing: deprecated alias for defer_insert_commits. TRUNCATE
+#   auto-commits as DDL regardless of this setting.
 commit_mode: per_table
 
 # Change to "" to use conventional INSERT (slower but allows
 # concurrent reads during load).
 insert_hint: "/*+ APPEND */"
+
+# Per-call timeout in seconds. 0 (default) disables it. Set to a
+# sensible upper bound (e.g. 3600 for a 1-hour ceiling per Oracle
+# call) so a runaway INSERT can't hang the CLI indefinitely.
+call_timeout_seconds: 0
+
+# Cross-host source link. Leave commented out for same-instance
+# refresh — the schema-refresh CLI does not support cross-host (use
+# oracdb for that). Accepted forms:
+#   existing:LINK_NAME  — reuse a DBA-provisioned DB link.
+#   session             — create a private link at job start, drop on
+#                          exit. Requires CREATE DATABASE LINK priv.
+# dblink: existing:PROD_US02_LINK
