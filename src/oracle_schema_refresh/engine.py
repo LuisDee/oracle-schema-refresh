@@ -107,16 +107,15 @@ class RefreshEngine:
         target: Endpoint,
         config: RefreshConfig,
     ) -> RefreshEngine:
-        """Construct an engine with distinct source / target endpoints.
+        """Construct an engine with explicit source / target endpoints.
 
-        Cut 0 still requires both endpoints to share a DSN — cross-host
-        execution lands in Cut 1b. Passing distinct DSNs today raises
-        ``ValueError`` so callers don't silently get same-instance behaviour
-        when they expect cross-host.
+        Distinct DSNs require ``config.dblink`` to be set (either
+        ``"existing:NAME"`` or ``"session"``). Same DSNs are always fine.
         """
-        if source.dsn != target.dsn:
+        if source.dsn != target.dsn and config.dblink is None:
             raise ValueError(
-                "Cross-host endpoints not yet supported (lands in Cut 1b). "
+                "Cross-host endpoints require config.dblink to be set "
+                "('session' or 'existing:NAME'). "
                 f"source.dsn={source.dsn!r} target.dsn={target.dsn!r}"
             )
         instance = cls.__new__(cls)
@@ -124,6 +123,11 @@ class RefreshEngine:
         instance._target = target
         instance._config = config
         return instance
+
+    @property
+    def _is_cross_host(self) -> bool:
+        """True iff the run uses a dblink to reach a separate source endpoint."""
+        return self._config.dblink is not None
 
     # ------------------------------------------------------------------
     # Public API
@@ -138,49 +142,98 @@ class RefreshEngine:
         Returns:
             RefreshResult with per-table outcomes and totals.
         """
+        from oracle_schema_refresh.endpoints.dblink import dblink_for
+
         t0 = time.monotonic()
-        # Same-instance refresh uses ONE connection deliberately: opening a
-        # second session to the same DSN would waste a session slot and gain
-        # nothing — there's no network round-trip to amortise and a single
-        # session sees its own uncommitted writes (which we need for the
-        # post-INSERT row-count check in per_table mode). Cut 1b splits
-        # source/target across two real connections; until then the abstraction
-        # is in place (``self._source``, ``self._target``) but the work goes
-        # over ``self._target`` exclusively.
-        conn = self._target.connect()
-        if self._config.call_timeout_seconds > 0:
-            # python-oracledb expects milliseconds.
-            conn.call_timeout = self._config.call_timeout_seconds * 1000
+
+        target_conn = self._target.connect()
+        self._apply_call_timeout(target_conn)
+        # Cross-host: open a second source connection for metadata reads
+        # (SCN, column lists, source row count). The data plane still goes
+        # entirely through ``target_conn`` via the dblink — no row data
+        # flows through Python.
+        # Same-instance: reuse the single connection (one session sees its
+        # own uncommitted writes — needed for post-INSERT row counts in
+        # per_table mode).
+        source_conn: Any
+        if self._is_cross_host:
+            source_conn = self._source.connect()
+            self._apply_call_timeout(source_conn)
+        else:
+            source_conn = target_conn
+
         try:
-            result = self._execute(conn, dry_run=dry_run)
+            if self._is_cross_host and not dry_run:
+                with dblink_for(
+                    target_conn, self._source, self._config.dblink
+                ) as link_name:
+                    result = self._execute(
+                        source_conn, target_conn, link_name, dry_run=dry_run
+                    )
+            else:
+                result = self._execute(
+                    source_conn, target_conn, None, dry_run=dry_run
+                )
         finally:
-            conn.close()
+            if source_conn is not target_conn:
+                source_conn.close()
+            target_conn.close()
+
         result.total_duration_seconds = time.monotonic() - t0
         log.info(
             "refresh_complete",
             success=result.success,
             total_seconds=round(result.total_duration_seconds, 2),
             dry_run=dry_run,
+            cross_host=self._is_cross_host,
         )
         return result
+
+    def _apply_call_timeout(self, conn: Any) -> None:
+        if self._config.call_timeout_seconds > 0:
+            # python-oracledb expects milliseconds.
+            conn.call_timeout = self._config.call_timeout_seconds * 1000
 
     # ------------------------------------------------------------------
     # Internal orchestration
     # ------------------------------------------------------------------
 
-    def _execute(self, conn: Any, dry_run: bool) -> RefreshResult:
+    def _execute(
+        self,
+        source_conn: Any,
+        target_conn: Any,
+        dblink_name: str | None,
+        dry_run: bool,
+    ) -> RefreshResult:
+        """Run the 5-phase refresh.
+
+        ``source_conn`` and ``target_conn`` are the same object for an
+        intra-instance run; distinct sessions for cross-host. ``dblink_name``
+        is the resolved DB-link name (e.g. ``"ORACDB_AB12CD"``) when
+        cross-host, ``None`` otherwise.
+
+        Routing rules:
+            * Source-schema reads (SCN, columns, FK parents, source row
+              count, DDL extraction) → ``source_conn``.
+            * Target-schema reads and all writes (table_exists target, FK
+              constraints, DDL, TRUNCATE, INSERT, target row count, sequence
+              reset, commit/rollback) → ``target_conn``.
+            * INSERT … SELECT runs on ``target_conn``; its SELECT references
+              the source via ``... FROM "SRC"."tbl"@dblink_name`` when
+              ``dblink_name`` is set.
+        """
         cfg = self._config
         overall_success = True
 
         # Capture one SCN at job start so every source read in this run sees a
-        # transactionally consistent snapshot. Cheap intra-instance; in Cut 1b
-        # it comes from the source endpoint.
+        # transactionally consistent snapshot. Read from the source session.
         scn: int | None = None
         server_version: int | None = None
         if not dry_run:
-            scn = self._capture_scn(conn)
+            scn = self._capture_scn(source_conn)
             log.info("scn_captured", scn=scn)
-            server_version = introspect.get_server_version(conn)
+            # Target version drives ALTER SEQUENCE RESTART feasibility.
+            server_version = introspect.get_server_version(target_conn)
             log.info("server_version", major=server_version)
 
         # ── Phase 1: INTROSPECT ────────────────────────────────────────
@@ -188,11 +241,15 @@ class RefreshEngine:
         seed_tables = list(cfg.tables)
 
         if cfg.auto_include_fk_parents:
-            resolved = introspect.discover_fk_parents(conn, cfg.source_schema, seed_tables)
+            resolved = introspect.discover_fk_parents(
+                source_conn, cfg.source_schema, seed_tables
+            )
         else:
             resolved = list(seed_tables)
 
-        graph = introspect.build_dependency_graph(conn, cfg.source_schema, resolved)
+        graph = introspect.build_dependency_graph(
+            source_conn, cfg.source_schema, resolved
+        )
         table_order = introspect.topological_sort(graph)  # parents first
 
         log.info(
@@ -205,33 +262,35 @@ class RefreshEngine:
         # ── Phase 2: PREPARE ───────────────────────────────────────────
         log.info("phase_start", phase=2, description="prepare tables")
         for table in table_order:
-            if not introspect.table_exists(conn, cfg.source_schema, table):
+            if not introspect.table_exists(source_conn, cfg.source_schema, table):
                 log.warning("source_table_missing", table=table, schema=cfg.source_schema)
                 continue  # handled gracefully in Phase 4
 
-            if not introspect.table_exists(conn, cfg.target_schema, table):
+            if not introspect.table_exists(target_conn, cfg.target_schema, table):
                 log.info("creating_table", table=table, target=cfg.target_schema)
                 if not dry_run:
-                    self._create_table(conn, table)
+                    self._create_table(source_conn, target_conn, table)
             elif cfg.recreate_tables:
                 log.info("recreating_table", table=table, target=cfg.target_schema)
                 if not dry_run:
-                    self._drop_table(conn, table)
-                    self._create_table(conn, table)
+                    self._drop_table(target_conn, table)
+                    self._create_table(source_conn, target_conn, table)
             else:
                 log.info("table_exists_keep_structure", table=table)
 
         # ── Phase 3: DISABLE FK CONSTRAINTS ───────────────────────────
         log.info("phase_start", phase=3, description="disable FK constraints")
         constraints = introspect.get_fk_constraints_on_target(
-            conn, cfg.target_schema, table_order
+            target_conn, cfg.target_schema, table_order
         )
         disabled_constraints: list[str] = []
         for c in constraints:
             if c["status"] == "ENABLED":
                 log.info("disabling_constraint", name=c["name"], table=c["table"])
                 if not dry_run:
-                    self._disable_constraint(conn, cfg.target_schema, c["table"], c["name"])
+                    self._disable_constraint(
+                        target_conn, cfg.target_schema, c["table"], c["name"]
+                    )
                 disabled_constraints.append(c["name"])
 
         # ── Phase 4: TRUNCATE AND LOAD ─────────────────────────────────
@@ -241,15 +300,15 @@ class RefreshEngine:
 
         # Truncate in reverse order (children first)
         for table in reverse_order:
-            if not introspect.table_exists(conn, cfg.target_schema, table):
+            if not introspect.table_exists(target_conn, cfg.target_schema, table):
                 continue
             log.info("truncating", table=table, target=cfg.target_schema)
             if not dry_run:
-                self._truncate(conn, cfg.target_schema, table)
+                self._truncate(target_conn, cfg.target_schema, table)
 
         # Insert in forward order (parents first)
         for table in table_order:
-            if not introspect.table_exists(conn, cfg.source_schema, table):
+            if not introspect.table_exists(source_conn, cfg.source_schema, table):
                 table_results.append(TableResult(table_name=table, status="skipped"))
                 log.warning("table_skipped_missing_source", table=table)
                 continue
@@ -257,27 +316,26 @@ class RefreshEngine:
             t_start = time.monotonic()
             try:
                 if not dry_run:
-                    self._insert_table(conn, table, scn=scn)
+                    self._insert_table(
+                        source_conn, target_conn, table, scn=scn, dblink=dblink_name
+                    )
                 if dry_run:
                     rows_source = 0
                     rows_target = 0
                 else:
                     rows_source = introspect.get_table_row_count(
-                        conn, cfg.source_schema, table, as_of_scn=scn
+                        source_conn, cfg.source_schema, table, as_of_scn=scn
                     )
                     rows_target = introspect.get_table_row_count(
-                        conn, cfg.target_schema, table
+                        target_conn, cfg.target_schema, table
                     )
                 match = rows_source == rows_target if not dry_run else None
                 status = "ok" if dry_run or match else "failed"
                 if not dry_run and not match:
                     overall_success = False
-                # Commit-or-rollback decision moved after the match check so we
-                # never commit a known-bad INSERT. defer-mode rollback is
-                # decided at the end of phase 4 below.
                 if not dry_run and cfg.commit_mode == "per_table":
                     if match:
-                        conn.commit()
+                        target_conn.commit()
                     else:
                         log.error(
                             "per_table_rollback_due_to_mismatch",
@@ -285,9 +343,9 @@ class RefreshEngine:
                             rows_source=rows_source,
                             rows_target=rows_target,
                         )
-                        conn.rollback()
+                        target_conn.rollback()
                 sequences_reset = (
-                    self._reset_identity_sequences(conn, table, server_version)
+                    self._reset_identity_sequences(target_conn, table, server_version)
                     if not dry_run and status == "ok"
                     else []
                 )
@@ -330,17 +388,15 @@ class RefreshEngine:
                 )
 
         if not dry_run and cfg.commit_mode == "defer_insert_commits":
-            # If any table mismatched, the whole batch is poisoned — rollback
-            # rather than commit a half-bad load.
             any_failed = any(r.status == "failed" for r in table_results)
             if any_failed:
                 log.error(
                     "defer_mode_rollback_due_to_mismatch",
                     failed_tables=[r.table_name for r in table_results if r.status == "failed"],
                 )
-                conn.rollback()
+                target_conn.rollback()
             else:
-                conn.commit()
+                target_conn.commit()
 
         # ── Phase 5: RE-ENABLE FK CONSTRAINTS ─────────────────────────
         log.info("phase_start", phase=5, description="re-enable FK constraints")
@@ -350,7 +406,9 @@ class RefreshEngine:
                 log.info("enabling_constraint", name=c["name"], table=c["table"])
                 if not dry_run:
                     try:
-                        self._enable_constraint(conn, cfg.target_schema, c["table"], c["name"])
+                        self._enable_constraint(
+                            target_conn, cfg.target_schema, c["table"], c["name"]
+                        )
                         reenabled.append(c["name"])
                     except oracledb.DatabaseError as exc:
                         code = getattr(exc.args[0], "code", None) if exc.args else None
@@ -484,12 +542,16 @@ class RefreshEngine:
                 else:
                     raise
 
-    def _create_table(self, conn: Any, table: str) -> None:
+    def _create_table(
+        self, source_conn: Any, target_conn: Any, table: str
+    ) -> None:
         cfg = self._config
-        ddl = introspect.get_table_ddl(conn, cfg.source_schema, table, cfg.target_schema)
+        ddl = introspect.get_table_ddl(
+            source_conn, cfg.source_schema, table, cfg.target_schema
+        )
         # ORA-00955: name already used by an existing object — fine on
         # idempotent re-runs when the table is already there.
-        self._safe_execute(conn, ddl, ignore_codes=frozenset({955}))
+        self._safe_execute(target_conn, ddl, ignore_codes=frozenset({955}))
 
         # FK constraints as ALTER TABLE (emitted separately via REF_CONSTRAINTS=FALSE
         # in get_table_ddl; would need a separate GET_DDL call for 'REF_CONSTRAINT'
@@ -497,13 +559,13 @@ class RefreshEngine:
         # constraints are disabled/re-enabled around the data load anyway)
 
         for index_ddl in introspect.get_index_ddl(
-            conn, cfg.source_schema, table, cfg.target_schema
+            source_conn, cfg.source_schema, table, cfg.target_schema
         ):
             # ORA-00955: index name already exists.
             # ORA-01408: such column list already indexed (a different name
             # but the same column set, idempotent).
             self._safe_execute(
-                conn, index_ddl, ignore_codes=frozenset({955, 1408})
+                target_conn, index_ddl, ignore_codes=frozenset({955, 1408})
             )
 
     def _drop_table(self, conn: Any, table: str) -> None:
@@ -518,24 +580,34 @@ class RefreshEngine:
         with conn.cursor() as cur:
             cur.execute(sql)
 
-    def _insert_table(self, conn: Any, table: str, scn: int | None = None) -> None:
+    def _insert_table(
+        self,
+        source_conn: Any,
+        target_conn: Any,
+        table: str,
+        scn: int | None = None,
+        dblink: str | None = None,
+    ) -> None:
         """Insert source rows into the target with an explicit column list.
 
         The column list is the intersection of source and target columns
-        (in target column order). Columns present on the source but not on
+        in target column order. Columns present on the source but not on
         the target are silently dropped; columns present on the target but
-        not the source get their declared default / NULL. This is how we
-        survive a schema-drift on the source.
+        not the source get their declared default / NULL.
 
         When ``scn`` is set, the SELECT uses ``AS OF SCN`` so the read is
-        consistent with the rest of the job.
+        consistent with the rest of the job. When ``dblink`` is set, the
+        SELECT references ``"SRC"."tbl"@<dblink>`` and the read crosses
+        the DB link from the target session.
         """
         cfg = self._config
-        source_cols = introspect.get_table_columns(conn, cfg.source_schema, table)
-        target_cols = introspect.get_table_columns(conn, cfg.target_schema, table)
+        source_cols = introspect.get_table_columns(
+            source_conn, cfg.source_schema, table
+        )
+        target_cols = introspect.get_table_columns(
+            target_conn, cfg.target_schema, table
+        )
         source_set = set(source_cols)
-        # Preserve target column order so the projection lines up with the
-        # INSERT column list.
         common = [c for c in target_cols if c in source_set]
         if not common:
             raise ValueError(
@@ -543,21 +615,19 @@ class RefreshEngine:
             )
         col_list = ", ".join(f'"{c}"' for c in common)
         hint = f" {cfg.insert_hint}" if cfg.insert_hint else ""
-        if scn is None:
-            sql = (
-                f'INSERT{hint} INTO "{cfg.target_schema}"."{table}" ({col_list}) '
-                f'SELECT {col_list} FROM "{cfg.source_schema}"."{table}"'
-            )
-            with conn.cursor() as cur:
-                cur.execute(sql)
-        else:
-            sql = (
-                f'INSERT{hint} INTO "{cfg.target_schema}"."{table}" ({col_list}) '
-                f'SELECT {col_list} FROM "{cfg.source_schema}"."{table}" '
-                f"AS OF SCN :scn"
-            )
-            with conn.cursor() as cur:
+        source_ref = f'"{cfg.source_schema}"."{table}"'
+        if dblink is not None:
+            source_ref = f"{source_ref}@{dblink}"
+        scn_clause = " AS OF SCN :scn" if scn is not None else ""
+        sql = (
+            f'INSERT{hint} INTO "{cfg.target_schema}"."{table}" ({col_list}) '
+            f"SELECT {col_list} FROM {source_ref}{scn_clause}"
+        )
+        with target_conn.cursor() as cur:
+            if scn is not None:
                 cur.execute(sql, scn=scn)
+            else:
+                cur.execute(sql)
 
     def _disable_constraint(
         self, conn: Any, schema: str, table: str, constraint: str

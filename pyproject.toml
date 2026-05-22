@@ -20,6 +20,7 @@ dev = [
 
 [project.scripts]
 schema-refresh = "oracle_schema_refresh.cli:cli"
+oracdb = "oracle_schema_refresh.oracdb_cli:oracdb"
 
 [build-system]
 requires = ["hatchling"]

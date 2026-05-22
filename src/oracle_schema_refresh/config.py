@@ -51,6 +51,11 @@ class RefreshConfig(BaseModel):
     )
     insert_hint: str = "/*+ APPEND */"
     call_timeout_seconds: int = 0
+    dblink: str | None = None
+    """Cross-host source link. ``"existing:NAME"`` to reuse a DBA-provisioned
+    DB link; ``"session"`` to create a private link for the job's lifetime.
+    ``None`` is intra-instance — no dblink, source reads go through the same
+    connection as the target."""
 
     @field_validator("tables")
     @classmethod
@@ -84,3 +89,22 @@ class RefreshConfig(BaseModel):
         if v < 0:
             raise ValueError("call_timeout_seconds must be >= 0")
         return v
+
+    @field_validator("dblink", mode="after")
+    @classmethod
+    def validate_dblink(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v == "session":
+            return v
+        if v.startswith("existing:"):
+            name = v[len("existing:") :]
+            if not name:
+                raise ValueError(
+                    "dblink='existing:' requires a DB link name after the colon"
+                )
+            return v
+        raise ValueError(
+            "dblink must be 'session' or 'existing:NAME' "
+            f"(got {v!r})"
+        )
