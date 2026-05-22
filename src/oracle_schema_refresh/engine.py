@@ -14,26 +14,29 @@ from oracle_schema_refresh.endpoints import Endpoint
 
 log = structlog.get_logger()
 
-# ORA error codes that are safe to ignore (idempotent operations)
-_IDEMPOTENT_ORA_CODES: frozenset[int] = frozenset({
-    955,   # ORA-00955: name already used by an existing object
-    2275,  # ORA-02275: such a referential constraint already exists
-    1408,  # ORA-01408: such column list already indexed
-})
-
 # ORA-02298: cannot validate — parent keys not found
 _ORA_FK_VALIDATE_FAIL = 2298
 
 
 @dataclass
 class TableResult:
-    """Result for a single table refresh."""
+    """Result for a single table refresh.
+
+    ``rows_loaded`` is the row count on the target after insert.
+    ``rows_source`` is the row count on the source ``AS OF SCN`` — i.e.
+    the snapshot the load read from. ``match`` is ``True`` iff they're
+    equal; mismatches force ``status='failed'`` even if no exception was
+    raised by Oracle.
+    """
 
     table_name: str
     status: str  # "ok" | "skipped" | "failed"
     rows_loaded: int = 0
+    rows_source: int = 0
+    match: bool | None = None
     duration_seconds: float = 0.0
     error: str | None = None
+    sequences_reset: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -48,6 +51,7 @@ class RefreshResult:
     constraints_disabled: list[str] = field(default_factory=list)
     constraints_reenabled: list[str] = field(default_factory=list)
     total_duration_seconds: float = 0.0
+    scn: int | None = None
 
     def summary(self) -> dict[str, Any]:
         """Return a JSON-serialisable summary dict."""
@@ -55,11 +59,15 @@ class RefreshResult:
             "success": self.success,
             "tables_requested": self.tables_requested,
             "table_order": self.table_order,
+            "scn": self.scn,
             "results": [
                 {
                     "table": r.table_name,
                     "status": r.status,
                     "rows": r.rows_loaded,
+                    "rows_source": r.rows_source,
+                    "match": r.match,
+                    "sequences_reset": r.sequences_reset,
                     "error": r.error,
                 }
                 for r in self.table_results
@@ -135,6 +143,9 @@ class RefreshEngine:
         # one connection handles both. Cut 1b will open a connection per
         # endpoint and route reads/writes accordingly.
         conn = self._target.connect()
+        if self._config.call_timeout_seconds > 0:
+            # python-oracledb expects milliseconds.
+            conn.call_timeout = self._config.call_timeout_seconds * 1000
         try:
             result = self._execute(conn, dry_run=dry_run)
         finally:
@@ -155,6 +166,14 @@ class RefreshEngine:
     def _execute(self, conn: Any, dry_run: bool) -> RefreshResult:
         cfg = self._config
         overall_success = True
+
+        # Capture one SCN at job start so every source read in this run sees a
+        # transactionally consistent snapshot. Cheap intra-instance; in Cut 1b
+        # it comes from the source endpoint.
+        scn: int | None = None
+        if not dry_run:
+            scn = self._capture_scn(conn)
+            log.info("scn_captured", scn=scn)
 
         # ── Phase 1: INTROSPECT ────────────────────────────────────────
         log.info("phase_start", phase=1, description="introspect")
@@ -230,22 +249,51 @@ class RefreshEngine:
             t_start = time.monotonic()
             try:
                 if not dry_run:
-                    self._insert_table(conn, table)
+                    self._insert_table(conn, table, scn=scn)
                     if cfg.commit_mode == "per_table":
                         conn.commit()
-                rows = (
-                    introspect.get_table_row_count(conn, cfg.target_schema, table)
-                    if not dry_run
-                    else 0
+                if dry_run:
+                    rows_source = 0
+                    rows_target = 0
+                else:
+                    rows_source = introspect.get_table_row_count(
+                        conn, cfg.source_schema, table, as_of_scn=scn
+                    )
+                    rows_target = introspect.get_table_row_count(
+                        conn, cfg.target_schema, table
+                    )
+                match = rows_source == rows_target if not dry_run else None
+                status = "ok" if dry_run or match else "failed"
+                if not dry_run and not match:
+                    overall_success = False
+                sequences_reset = (
+                    self._reset_identity_sequences(conn, table)
+                    if not dry_run and status == "ok"
+                    else []
                 )
                 dur = time.monotonic() - t_start
-                log.info("table_loaded", table=table, rows=rows, duration=round(dur, 2))
+                log.info(
+                    "table_loaded",
+                    table=table,
+                    rows_source=rows_source,
+                    rows_target=rows_target,
+                    match=match,
+                    duration=round(dur, 2),
+                )
                 table_results.append(
                     TableResult(
                         table_name=table,
-                        status="ok",
-                        rows_loaded=rows,
+                        status=status,
+                        rows_loaded=rows_target,
+                        rows_source=rows_source,
+                        match=match,
                         duration_seconds=dur,
+                        sequences_reset=sequences_reset,
+                        error=(
+                            None
+                            if status == "ok"
+                            else f"row count mismatch: source={rows_source} target={rows_target}"
+                        ),
                     )
                 )
             except (oracledb.DatabaseError, oracledb.InterfaceError) as exc:
@@ -261,7 +309,7 @@ class RefreshEngine:
                     )
                 )
 
-        if not dry_run and cfg.commit_mode == "all_or_nothing":
+        if not dry_run and cfg.commit_mode == "defer_insert_commits":
             conn.commit()
 
         # ── Phase 5: RE-ENABLE FK CONSTRAINTS ─────────────────────────
@@ -297,16 +345,76 @@ class RefreshEngine:
             table_results=table_results,
             constraints_disabled=disabled_constraints,
             constraints_reenabled=reenabled,
+            scn=scn,
         )
+
+    # ------------------------------------------------------------------
+    # SCN capture & identity-sequence reset
+    # ------------------------------------------------------------------
+
+    def _capture_scn(self, conn: Any) -> int:
+        """Read the source's current SCN; used as the Flashback Query anchor."""
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_scn FROM v$database")
+            row = cur.fetchone()
+            return int(row[0])
+
+    def _reset_identity_sequences(self, conn: Any, table: str) -> list[str]:
+        """Restart identity-column sequences on the target so future inserts
+        don't collide with the loaded data.
+
+        Requires Oracle 18c+ (``ALTER SEQUENCE ... RESTART``). Failures are
+        logged and swallowed — sequence reset is best-effort and must not
+        abort an otherwise-successful run.
+        """
+        cfg = self._config
+        reset: list[str] = []
+        identity_cols = introspect.get_identity_columns(conn, cfg.target_schema, table)
+        for col_name, seq_name in identity_cols:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f'SELECT NVL(MAX("{col_name}"), 0) + 1 '  # noqa: S608
+                        f'FROM "{cfg.target_schema}"."{table}"'
+                    )
+                    start_with = int(cur.fetchone()[0])
+                    cur.execute(
+                        f'ALTER SEQUENCE "{cfg.target_schema}"."{seq_name}" '
+                        f"RESTART START WITH {start_with}"
+                    )
+                reset.append(seq_name)
+                log.info(
+                    "sequence_reset",
+                    table=table,
+                    column=col_name,
+                    sequence=seq_name,
+                    start_with=start_with,
+                )
+            except oracledb.DatabaseError as exc:
+                log.warning(
+                    "sequence_reset_failed",
+                    table=table,
+                    sequence=seq_name,
+                    error=str(exc),
+                )
+        return reset
 
     # ------------------------------------------------------------------
     # DDL / DML helpers
     # ------------------------------------------------------------------
 
     def _safe_execute(
-        self, conn: Any, sql: str, ignore_codes: frozenset[int] = _IDEMPOTENT_ORA_CODES
+        self,
+        conn: Any,
+        sql: str,
+        ignore_codes: frozenset[int] = frozenset(),
     ) -> None:
-        """Execute SQL, swallowing known idempotent ORA error codes."""
+        """Execute SQL, swallowing only the ORA codes the caller opted into.
+
+        Default is the empty set — silent swallowing masks real bugs.
+        Callers pass the precise codes they tolerate (e.g. ``{955}`` for
+        "table already exists" on CREATE TABLE).
+        """
         with conn.cursor() as cur:
             try:
                 cur.execute(sql)
@@ -320,7 +428,9 @@ class RefreshEngine:
     def _create_table(self, conn: Any, table: str) -> None:
         cfg = self._config
         ddl = introspect.get_table_ddl(conn, cfg.source_schema, table, cfg.target_schema)
-        self._safe_execute(conn, ddl)
+        # ORA-00955: name already used by an existing object — fine on
+        # idempotent re-runs when the table is already there.
+        self._safe_execute(conn, ddl, ignore_codes=frozenset({955}))
 
         # FK constraints as ALTER TABLE (emitted separately via REF_CONSTRAINTS=FALSE
         # in get_table_ddl; would need a separate GET_DDL call for 'REF_CONSTRAINT'
@@ -330,7 +440,12 @@ class RefreshEngine:
         for index_ddl in introspect.get_index_ddl(
             conn, cfg.source_schema, table, cfg.target_schema
         ):
-            self._safe_execute(conn, index_ddl)
+            # ORA-00955: index name already exists.
+            # ORA-01408: such column list already indexed (a different name
+            # but the same column set, idempotent).
+            self._safe_execute(
+                conn, index_ddl, ignore_codes=frozenset({955, 1408})
+            )
 
     def _drop_table(self, conn: Any, table: str) -> None:
         cfg = self._config
@@ -344,15 +459,46 @@ class RefreshEngine:
         with conn.cursor() as cur:
             cur.execute(sql)
 
-    def _insert_table(self, conn: Any, table: str) -> None:
+    def _insert_table(self, conn: Any, table: str, scn: int | None = None) -> None:
+        """Insert source rows into the target with an explicit column list.
+
+        The column list is the intersection of source and target columns
+        (in target column order). Columns present on the source but not on
+        the target are silently dropped; columns present on the target but
+        not the source get their declared default / NULL. This is how we
+        survive a schema-drift on the source.
+
+        When ``scn`` is set, the SELECT uses ``AS OF SCN`` so the read is
+        consistent with the rest of the job.
+        """
         cfg = self._config
+        source_cols = introspect.get_table_columns(conn, cfg.source_schema, table)
+        target_cols = introspect.get_table_columns(conn, cfg.target_schema, table)
+        source_set = set(source_cols)
+        # Preserve target column order so the projection lines up with the
+        # INSERT column list.
+        common = [c for c in target_cols if c in source_set]
+        if not common:
+            raise ValueError(
+                f"No overlapping columns between source and target for table {table!r}"
+            )
+        col_list = ", ".join(f'"{c}"' for c in common)
         hint = f" {cfg.insert_hint}" if cfg.insert_hint else ""
-        sql = (
-            f'INSERT{hint} INTO "{cfg.target_schema}"."{table}" '
-            f'SELECT * FROM "{cfg.source_schema}"."{table}"'
-        )
-        with conn.cursor() as cur:
-            cur.execute(sql)
+        if scn is None:
+            sql = (
+                f'INSERT{hint} INTO "{cfg.target_schema}"."{table}" ({col_list}) '
+                f'SELECT {col_list} FROM "{cfg.source_schema}"."{table}"'
+            )
+            with conn.cursor() as cur:
+                cur.execute(sql)
+        else:
+            sql = (
+                f'INSERT{hint} INTO "{cfg.target_schema}"."{table}" ({col_list}) '
+                f'SELECT {col_list} FROM "{cfg.source_schema}"."{table}" '
+                f"AS OF SCN :scn"
+            )
+            with conn.cursor() as cur:
+                cur.execute(sql, scn=scn)
 
     def _disable_constraint(
         self, conn: Any, schema: str, table: str, constraint: str

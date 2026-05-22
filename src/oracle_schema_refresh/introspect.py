@@ -307,9 +307,68 @@ def get_fk_constraints_on_target(
         ]
 
 
-def get_table_row_count(conn: Any, schema: str, table_name: str) -> int:
-    """Return the current row count for a table."""
+def get_table_row_count(
+    conn: Any,
+    schema: str,
+    table_name: str,
+    as_of_scn: int | None = None,
+) -> int:
+    """Return the row count for a table.
+
+    If ``as_of_scn`` is provided, the count uses a Flashback Query read
+    (``AS OF SCN :scn``) so it matches a job's consistent snapshot.
+    """
     with conn.cursor() as cur:
-        cur.execute(f'SELECT COUNT(*) FROM "{schema}"."{table_name}"')  # noqa: S608
+        if as_of_scn is None:
+            cur.execute(f'SELECT COUNT(*) FROM "{schema}"."{table_name}"')  # noqa: S608
+        else:
+            cur.execute(
+                f'SELECT COUNT(*) FROM "{schema}"."{table_name}" AS OF SCN :scn',  # noqa: S608
+                scn=as_of_scn,
+            )
         row = cur.fetchone()
         return int(row[0])
+
+
+def get_table_columns(conn: Any, schema: str, table_name: str) -> list[str]:
+    """Return the column names of a table in declaration order.
+
+    Used to generate explicit column lists for INSERT … SELECT so adding a
+    column on the source can't break the target load via a position
+    mismatch.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+              FROM all_tab_columns
+             WHERE owner = :schema AND table_name = :table_name
+             ORDER BY column_id
+            """,
+            schema=schema,
+            table_name=table_name,
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def get_identity_columns(
+    conn: Any, schema: str, table_name: str
+) -> list[tuple[str, str]]:
+    """Return ``(column_name, sequence_name)`` for each identity column.
+
+    Only Oracle-12c+ IDENTITY columns are returned; classic
+    sequence-backed columns (where a trigger or default calls ``seq.NEXTVAL``)
+    are not detectable from a single catalog view and remain a known
+    limitation until Cut 2.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name, sequence_name
+              FROM all_tab_identity_cols
+             WHERE owner = :schema AND table_name = :table_name
+            """,
+            schema=schema,
+            table_name=table_name,
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]

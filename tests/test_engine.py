@@ -136,10 +136,18 @@ def test_engine_phase3_disables_enabled_fk_constraints() -> None:
                         return_value=fake_constraints,
                     ):
                         with patch(
-                            "oracle_schema_refresh.engine.introspect.get_table_row_count",
-                            return_value=0,
+                            "oracle_schema_refresh.engine.introspect.get_table_columns",
+                            return_value=["C1"],
                         ):
-                            result = engine.run(dry_run=False)  # type: ignore[union-attr]
+                            with patch(
+                                "oracle_schema_refresh.engine.introspect.get_identity_columns",
+                                return_value=[],
+                            ):
+                                with patch(
+                                    "oracle_schema_refresh.engine.introspect.get_table_row_count",
+                                    return_value=0,
+                                ):
+                                    result = engine.run(dry_run=False)  # type: ignore[union-attr]
 
     assert "FK_ONE" in result.constraints_disabled
 
@@ -178,10 +186,18 @@ def test_engine_phase4_inserts_each_table() -> None:
                         return_value=[],
                     ):
                         with patch(
-                            "oracle_schema_refresh.engine.introspect.get_table_row_count",
-                            return_value=5,
+                            "oracle_schema_refresh.engine.introspect.get_table_columns",
+                            return_value=["C1"],
                         ):
-                            engine.run(dry_run=False)  # type: ignore[union-attr]
+                            with patch(
+                                "oracle_schema_refresh.engine.introspect.get_identity_columns",
+                                return_value=[],
+                            ):
+                                with patch(
+                                    "oracle_schema_refresh.engine.introspect.get_table_row_count",
+                                    return_value=5,
+                                ):
+                                    engine.run(dry_run=False)  # type: ignore[union-attr]
 
     insert_sqls = [s for s in executed_sqls if "INSERT" in s.upper()]
     assert any("T1" in s for s in insert_sqls)
@@ -215,10 +231,18 @@ def test_engine_phase4_commits_per_table() -> None:
                         return_value=[],
                     ):
                         with patch(
-                            "oracle_schema_refresh.engine.introspect.get_table_row_count",
-                            return_value=0,
+                            "oracle_schema_refresh.engine.introspect.get_table_columns",
+                            return_value=["C1"],
                         ):
-                            engine.run(dry_run=False)  # type: ignore[union-attr]
+                            with patch(
+                                "oracle_schema_refresh.engine.introspect.get_identity_columns",
+                                return_value=[],
+                            ):
+                                with patch(
+                                    "oracle_schema_refresh.engine.introspect.get_table_row_count",
+                                    return_value=0,
+                                ):
+                                    engine.run(dry_run=False)  # type: ignore[union-attr]
 
     # commit should be called at least twice (once per table)
     assert mock_conn.commit.call_count >= 2
@@ -252,10 +276,18 @@ def test_engine_phase5_reenables_constraints() -> None:
                         return_value=fake_constraints,
                     ):
                         with patch(
-                            "oracle_schema_refresh.engine.introspect.get_table_row_count",
-                            return_value=0,
+                            "oracle_schema_refresh.engine.introspect.get_table_columns",
+                            return_value=["C1"],
                         ):
-                            result = engine.run(dry_run=False)  # type: ignore[union-attr]
+                            with patch(
+                                "oracle_schema_refresh.engine.introspect.get_identity_columns",
+                                return_value=[],
+                            ):
+                                with patch(
+                                    "oracle_schema_refresh.engine.introspect.get_table_row_count",
+                                    return_value=0,
+                                ):
+                                    result = engine.run(dry_run=False)  # type: ignore[union-attr]
 
     assert "FK_ONE" in result.constraints_reenabled
 
@@ -343,17 +375,30 @@ def test_engine_swallows_ora_00955_on_create_table() -> None:
                                 return_value=[],
                             ):
                                 with patch(
-                                    "oracle_schema_refresh.engine.introspect.get_table_row_count",
-                                    return_value=0,
+                                    "oracle_schema_refresh.engine.introspect.get_table_columns",
+                                    return_value=["C1"],
                                 ):
-                                    def raise_on_create(sql: str, *a: object, **kw: object) -> None:
-                                        if isinstance(sql, str) and "CREATE TABLE" in sql.upper():
-                                            raise ora_err
+                                    with patch(
+                                        "oracle_schema_refresh.engine.introspect.get_identity_columns",
+                                        return_value=[],
+                                    ):
+                                        with patch(
+                                            "oracle_schema_refresh.engine.introspect.get_table_row_count",
+                                            return_value=0,
+                                        ):
+                                            def raise_on_create(
+                                                sql: str, *a: object, **kw: object
+                                            ) -> None:
+                                                if (
+                                                    isinstance(sql, str)
+                                                    and "CREATE TABLE" in sql.upper()
+                                                ):
+                                                    raise ora_err
 
-                                    cur = mock_conn.cursor().__enter__()
-                                    cur.execute.side_effect = raise_on_create
-                                    # Should not raise — ORA-00955 is swallowed
-                                    result = engine.run(dry_run=False)  # type: ignore[union-attr]
+                                            cur = mock_conn.cursor().__enter__()
+                                            cur.execute.side_effect = raise_on_create
+                                            # Should not raise — ORA-00955 is swallowed
+                                            result = engine.run(dry_run=False)  # type: ignore[union-attr]
 
     assert result is not None
 
@@ -398,10 +443,18 @@ def test_engine_phase5_ora02298_marks_run_failed() -> None:
                         return_value=fake_constraints,
                     ):
                         with patch(
-                            "oracle_schema_refresh.engine.introspect.get_table_row_count",
-                            return_value=0,
+                            "oracle_schema_refresh.engine.introspect.get_table_columns",
+                            return_value=["C1"],
                         ):
-                            result = engine.run(dry_run=False)  # type: ignore[union-attr]
+                            with patch(
+                                "oracle_schema_refresh.engine.introspect.get_identity_columns",
+                                return_value=[],
+                            ):
+                                with patch(
+                                    "oracle_schema_refresh.engine.introspect.get_table_row_count",
+                                    return_value=0,
+                                ):
+                                    result = engine.run(dry_run=False)  # type: ignore[union-attr]
 
     assert result.success is False
     assert result.constraints_reenabled == []
@@ -435,10 +488,18 @@ def test_engine_all_or_nothing_commits_once_at_end() -> None:
                         return_value=[],
                     ):
                         with patch(
-                            "oracle_schema_refresh.engine.introspect.get_table_row_count",
-                            return_value=0,
+                            "oracle_schema_refresh.engine.introspect.get_table_columns",
+                            return_value=["C1"],
                         ):
-                            engine.run(dry_run=False)  # type: ignore[union-attr]
+                            with patch(
+                                "oracle_schema_refresh.engine.introspect.get_identity_columns",
+                                return_value=[],
+                            ):
+                                with patch(
+                                    "oracle_schema_refresh.engine.introspect.get_table_row_count",
+                                    return_value=0,
+                                ):
+                                    engine.run(dry_run=False)  # type: ignore[union-attr]
 
     assert mock_conn.commit.call_count == 1
 
