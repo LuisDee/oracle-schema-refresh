@@ -78,9 +78,18 @@ Both must keep working through every cut.
 ## Testing
 
 ```
-pytest -q              # all 124 unit tests, <1s
-ruff check src/ tests/ # zero warnings expected
+pytest -q                              # ~170 unit tests, <1s, mock-based
+pytest -m integration                  # tests/integration/, needs Docker or
+                                       # $ORACDB_TEST_DSN — skips cleanly
+                                       # otherwise with a clear reason
+ruff check src/ tests/                 # zero warnings expected
 ```
+
+Integration tests are gated behind ``@pytest.mark.integration`` and
+deselected by ``addopts`` in ``pyproject.toml``. The conftest under
+``tests/integration/`` provides a session-scoped Oracle (testcontainers
++ ``gvenzl/oracle-free:23-slim``) or honours ``$ORACDB_TEST_DSN`` if
+the user wants to point at an existing dev DB.
 
 When adding Oracle SQL, prefer tests that assert on the SQL string
 constructed rather than on the side effects of running it. Real-DB

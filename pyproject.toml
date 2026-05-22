@@ -17,6 +17,9 @@ dev = [
     "pytest-mock>=3.0",
     "ruff>=0.1",
 ]
+integration = [
+    "testcontainers>=4.0",
+]
 
 [project.scripts]
 schema-refresh = "oracle_schema_refresh.cli:cli"
@@ -31,7 +34,12 @@ packages = ["src/oracle_schema_refresh"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
+markers = [
+    "integration: needs a real Oracle (testcontainers or $ORACDB_TEST_DSN); skipped by default, opt in with `pytest -m integration`",
+]
+# Skip integration tests by default — unit suite must stay <1s.
+addopts = "-m 'not integration'"
 
 [tool.ruff]
 line-length = 100
