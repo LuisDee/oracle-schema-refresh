@@ -139,9 +139,14 @@ class RefreshEngine:
             RefreshResult with per-table outcomes and totals.
         """
         t0 = time.monotonic()
-        # Same-instance refresh: source and target are the same endpoint,
-        # one connection handles both. Cut 1b will open a connection per
-        # endpoint and route reads/writes accordingly.
+        # Same-instance refresh uses ONE connection deliberately: opening a
+        # second session to the same DSN would waste a session slot and gain
+        # nothing — there's no network round-trip to amortise and a single
+        # session sees its own uncommitted writes (which we need for the
+        # post-INSERT row-count check in per_table mode). Cut 1b splits
+        # source/target across two real connections; until then the abstraction
+        # is in place (``self._source``, ``self._target``) but the work goes
+        # over ``self._target`` exclusively.
         conn = self._target.connect()
         if self._config.call_timeout_seconds > 0:
             # python-oracledb expects milliseconds.
@@ -171,9 +176,12 @@ class RefreshEngine:
         # transactionally consistent snapshot. Cheap intra-instance; in Cut 1b
         # it comes from the source endpoint.
         scn: int | None = None
+        server_version: int | None = None
         if not dry_run:
             scn = self._capture_scn(conn)
             log.info("scn_captured", scn=scn)
+            server_version = introspect.get_server_version(conn)
+            log.info("server_version", major=server_version)
 
         # ── Phase 1: INTROSPECT ────────────────────────────────────────
         log.info("phase_start", phase=1, description="introspect")
@@ -250,8 +258,6 @@ class RefreshEngine:
             try:
                 if not dry_run:
                     self._insert_table(conn, table, scn=scn)
-                    if cfg.commit_mode == "per_table":
-                        conn.commit()
                 if dry_run:
                     rows_source = 0
                     rows_target = 0
@@ -266,8 +272,22 @@ class RefreshEngine:
                 status = "ok" if dry_run or match else "failed"
                 if not dry_run and not match:
                     overall_success = False
+                # Commit-or-rollback decision moved after the match check so we
+                # never commit a known-bad INSERT. defer-mode rollback is
+                # decided at the end of phase 4 below.
+                if not dry_run and cfg.commit_mode == "per_table":
+                    if match:
+                        conn.commit()
+                    else:
+                        log.error(
+                            "per_table_rollback_due_to_mismatch",
+                            table=table,
+                            rows_source=rows_source,
+                            rows_target=rows_target,
+                        )
+                        conn.rollback()
                 sequences_reset = (
-                    self._reset_identity_sequences(conn, table)
+                    self._reset_identity_sequences(conn, table, server_version)
                     if not dry_run and status == "ok"
                     else []
                 )
@@ -310,7 +330,17 @@ class RefreshEngine:
                 )
 
         if not dry_run and cfg.commit_mode == "defer_insert_commits":
-            conn.commit()
+            # If any table mismatched, the whole batch is poisoned — rollback
+            # rather than commit a half-bad load.
+            any_failed = any(r.status == "failed" for r in table_results)
+            if any_failed:
+                log.error(
+                    "defer_mode_rollback_due_to_mismatch",
+                    failed_tables=[r.table_name for r in table_results if r.status == "failed"],
+                )
+                conn.rollback()
+            else:
+                conn.commit()
 
         # ── Phase 5: RE-ENABLE FK CONSTRAINTS ─────────────────────────
         log.info("phase_start", phase=5, description="re-enable FK constraints")
@@ -359,18 +389,47 @@ class RefreshEngine:
             row = cur.fetchone()
             return int(row[0])
 
-    def _reset_identity_sequences(self, conn: Any, table: str) -> list[str]:
-        """Restart identity-column sequences on the target so future inserts
-        don't collide with the loaded data.
+    def _reset_identity_sequences(
+        self, conn: Any, table: str, server_version: int | None
+    ) -> list[str]:
+        """Restart sequences feeding the target table to ``MAX(col)+1``.
 
-        Requires Oracle 18c+ (``ALTER SEQUENCE ... RESTART``). Failures are
-        logged and swallowed — sequence reset is best-effort and must not
-        abort an otherwise-successful run.
+        Covers both Oracle-12c+ IDENTITY columns and classic sequence-backed
+        columns whose sequence is referenced via ``:NEW.col := seq.NEXTVAL``
+        in an enabled BEFORE-INSERT trigger.
+
+        ``ALTER SEQUENCE ... RESTART`` is Oracle-18c+. On older servers the
+        whole step is skipped with a single log line — preferable to a
+        spam-of-failures and a swallowed exception per sequence.
+
+        Failures on individual sequences are logged and swallowed —
+        sequence reset is best-effort and must not abort an otherwise-
+        successful run.
         """
         cfg = self._config
+
+        if server_version is not None and server_version < 18:
+            log.info(
+                "sequence_reset_skipped_pre_18c",
+                table=table,
+                server_version=server_version,
+            )
+            return []
+
+        identity = introspect.get_identity_columns(conn, cfg.target_schema, table)
+        trigger_seqs = introspect.get_sequence_columns_via_triggers(
+            conn, cfg.target_schema, table
+        )
+        # Deduplicate while preserving order: identity first, then triggers.
+        seen: set[tuple[str, str]] = set()
+        ordered: list[tuple[str, str]] = []
+        for item in [*identity, *trigger_seqs]:
+            if item not in seen:
+                seen.add(item)
+                ordered.append(item)
+
         reset: list[str] = []
-        identity_cols = introspect.get_identity_columns(conn, cfg.target_schema, table)
-        for col_name, seq_name in identity_cols:
+        for col_name, seq_name in ordered:
             try:
                 with conn.cursor() as cur:
                     cur.execute(

@@ -1,6 +1,7 @@
 """FK discovery, dependency graph, topological sort, and DDL extraction."""
 from __future__ import annotations
 
+import re
 from collections import deque
 from typing import Any
 
@@ -11,6 +12,13 @@ log = structlog.get_logger()
 
 # ORA-31608: object/type/attribute/named not found (no indexes found for table)
 _ORA_NO_OBJECTS = 31608
+
+# Trigger-body pattern: ":NEW.col := [schema.]seq.NEXTVAL".
+# Case-insensitive, tolerates whitespace and the optional schema prefix.
+_TRIGGER_SEQ_NEXTVAL = re.compile(
+    r":new\.([a-z0-9_$#]+)\s*:?=\s*(?:[a-z0-9_$#]+\.)?([a-z0-9_$#]+)\.nextval",
+    re.IGNORECASE,
+)
 
 
 def topological_sort(graph: dict[str, list[str]]) -> list[str]:
@@ -354,12 +362,11 @@ def get_table_columns(conn: Any, schema: str, table_name: str) -> list[str]:
 def get_identity_columns(
     conn: Any, schema: str, table_name: str
 ) -> list[tuple[str, str]]:
-    """Return ``(column_name, sequence_name)`` for each identity column.
+    """Return ``(column_name, sequence_name)`` for each Oracle-12c+ identity
+    column on the table.
 
-    Only Oracle-12c+ IDENTITY columns are returned; classic
-    sequence-backed columns (where a trigger or default calls ``seq.NEXTVAL``)
-    are not detectable from a single catalog view and remain a known
-    limitation until Cut 2.
+    Classic sequence-backed columns (trigger sets ``:NEW.col := seq.NEXTVAL``)
+    are picked up separately by :func:`get_sequence_columns_via_triggers`.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -372,3 +379,72 @@ def get_identity_columns(
             table_name=table_name,
         )
         return [(row[0], row[1]) for row in cur.fetchall()]
+
+
+def get_sequence_columns_via_triggers(
+    conn: Any, schema: str, table_name: str
+) -> list[tuple[str, str]]:
+    """Return ``(column_name, sequence_name)`` for trigger-driven sequence
+    columns on the table — best-effort.
+
+    Reads BEFORE-INSERT trigger bodies from ``all_triggers`` and pattern-matches
+    ``:NEW.col := [schema.]seq.NEXTVAL``. Won't catch every dialect (PL/SQL
+    that wraps the assignment in conditionals, e.g.) but covers the
+    overwhelming common case. The full-coverage answer requires the planned
+    Cut 2 strategy that consults schema-supplied mapping, hence the
+    best-effort label.
+
+    Catalog or LOB-read errors are swallowed with a logged warning — the
+    rest of the run must not abort because we couldn't sniff sequences.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT trigger_name, trigger_body
+                  FROM all_triggers
+                 WHERE owner = :schema
+                   AND table_name = :table_name
+                   AND triggering_event LIKE '%INSERT%'
+                   AND status = 'ENABLED'
+                """,
+                schema=schema,
+                table_name=table_name,
+            )
+            rows = cur.fetchall()
+    except oracledb.DatabaseError as exc:
+        log.warning("trigger_scan_failed", table=table_name, error=str(exc))
+        return []
+
+    found: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for trigger_name, body in rows:
+        try:
+            body_text = body.read() if hasattr(body, "read") else str(body or "")
+        except oracledb.DatabaseError as exc:
+            log.warning(
+                "trigger_body_read_failed",
+                trigger=trigger_name,
+                error=str(exc),
+            )
+            continue
+        for match in _TRIGGER_SEQ_NEXTVAL.finditer(body_text):
+            col = match.group(1).upper()
+            seq = match.group(2).upper()
+            key = (col, seq)
+            if key not in seen:
+                seen.add(key)
+                found.append(key)
+    return found
+
+
+def get_server_version(conn: Any) -> int:
+    """Return the major Oracle server version (e.g. 19, 21, 23).
+
+    Uses ``DBMS_DB_VERSION.VERSION`` which is a PL/SQL constant accessible
+    to any session — avoids the v$version / v$instance permission pitfalls.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT dbms_db_version.version FROM dual")
+        row = cur.fetchone()
+        return int(row[0])
