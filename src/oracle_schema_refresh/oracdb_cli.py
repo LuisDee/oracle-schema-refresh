@@ -233,6 +233,16 @@ def endpoints_test(ctx: click.Context, name: str) -> None:
     help="Required for cross-host copies. 'session' or 'existing:NAME'.",
 )
 @click.option(
+    "--strategy",
+    default="auto",
+    type=click.Choice(
+        ["auto", "direct_copy", "parallel_dml", "chunked_staging", "partition_exchange"]
+    ),
+    help="Per-table strategy. ``auto`` picks from the profile.",
+)
+@click.option("--max-parallel", type=int, default=4, show_default=True)
+@click.option("--max-chunks-per-table", type=int, default=4, show_default=True)
+@click.option(
     "--no-auto-fk",
     is_flag=True,
     default=False,
@@ -249,6 +259,9 @@ def cmd_copy(
     target_schema: str,
     tables: str,
     dblink: str | None,
+    strategy: str,
+    max_parallel: int,
+    max_chunks_per_table: int,
     no_auto_fk: bool,
     dry_run: bool,
     as_json: bool,
@@ -268,6 +281,9 @@ def cmd_copy(
             tables=[t.strip() for t in tables.split(",") if t.strip()],
             auto_include_fk_parents=not no_auto_fk,
             dblink=dblink,
+            strategy=strategy,
+            max_parallel=max_parallel,
+            max_chunks_per_table=max_chunks_per_table,
         )
     except Exception as exc:  # noqa: BLE001 — pydantic ValidationError, etc.
         raise click.ClickException(f"config error: {exc}") from exc
@@ -315,6 +331,16 @@ def _resolve_endpoint(reg: EndpointRegistry, name: str) -> Endpoint:
 @click.option("--target-schema", required=True)
 @click.option("--tables", required=True, help="Comma-separated list.")
 @click.option("--dblink", default=None, help="'session' or 'existing:NAME'.")
+@click.option(
+    "--strategy",
+    default="auto",
+    type=click.Choice(
+        ["auto", "direct_copy", "parallel_dml", "chunked_staging", "partition_exchange"]
+    ),
+    help="Per-table strategy. ``auto`` picks from the profile.",
+)
+@click.option("--max-parallel", type=int, default=4, show_default=True)
+@click.option("--max-chunks-per-table", type=int, default=4, show_default=True)
 @click.option("--no-auto-fk", is_flag=True, default=False)
 @click.option("--json", "as_json", is_flag=True, default=False)
 @click.pass_context
@@ -326,6 +352,9 @@ def cmd_plan(
     target_schema: str,
     tables: str,
     dblink: str | None,
+    strategy: str,
+    max_parallel: int,
+    max_chunks_per_table: int,
     no_auto_fk: bool,
     as_json: bool,
 ) -> None:
@@ -342,6 +371,9 @@ def cmd_plan(
             tables=table_list,
             auto_include_fk_parents=not no_auto_fk,
             dblink=dblink,
+            strategy=strategy,
+            max_parallel=max_parallel,
+            max_chunks_per_table=max_chunks_per_table,
         )
         engine = RefreshEngine.from_endpoints(src, tgt, cfg)
     except ValueError as exc:
@@ -380,6 +412,9 @@ def cmd_plan(
                     "commit_mode": cfg.commit_mode,
                     "insert_hint": cfg.insert_hint,
                     "call_timeout_seconds": cfg.call_timeout_seconds,
+                    "strategy": cfg.strategy,
+                    "max_parallel": cfg.max_parallel,
+                    "max_chunks_per_table": cfg.max_chunks_per_table,
                 }
             ),
             status="PLANNED",

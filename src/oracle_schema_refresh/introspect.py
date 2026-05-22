@@ -3,12 +3,106 @@ from __future__ import annotations
 
 import re
 from collections import deque
+from dataclasses import dataclass
 from typing import Any
 
 import oracledb
 import structlog
 
 log = structlog.get_logger()
+
+
+@dataclass
+class TableProfile:
+    """Strategy-choice inputs for a single table.
+
+    ``size_mb`` is a rough estimate from ``DBA_SEGMENTS`` (or 0 if the
+    user doesn't have segment access). ``rows`` is the optimiser
+    statistic from ``ALL_TABLES.num_rows`` — outdated stats are OK for
+    picking a strategy. ``has_long`` is a hard refusal flag because
+    LONG columns can't be selected over a dblink.
+    """
+
+    schema: str
+    table_name: str
+    rows: int = 0
+    size_mb: float = 0.0
+    partitioned: bool = False
+    has_lob: bool = False
+    has_long: bool = False
+
+
+def get_table_profile(conn: Any, schema: str, table_name: str) -> TableProfile:
+    """Profile a table for strategy selection.
+
+    Five queries — one per field. Cheap dictionary reads, fine to issue
+    per-table at plan time. Failures fall back to safe defaults
+    (``rows=0``, ``size_mb=0``) so an unprivileged session still gets a
+    usable profile (the picker just chooses ``direct_copy``).
+    """
+    rows = 0
+    size_mb = 0.0
+    partitioned = False
+    has_lob = False
+    has_long = False
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT num_rows FROM all_tables "
+            "WHERE owner = :s AND table_name = :t",
+            s=schema, t=table_name,
+        )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            rows = int(row[0])
+
+        cur.execute(
+            "SELECT SUM(bytes) FROM dba_segments "
+            "WHERE owner = :s AND segment_name = :t",
+            s=schema, t=table_name,
+        )
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            size_mb = float(row[0]) / (1024 * 1024)
+
+        cur.execute(
+            "SELECT partitioned FROM all_tables "
+            "WHERE owner = :s AND table_name = :t",
+            s=schema, t=table_name,
+        )
+        row = cur.fetchone()
+        if row and row[0] == "YES":
+            partitioned = True
+
+        cur.execute(
+            "SELECT COUNT(*) FROM all_tab_columns "
+            "WHERE owner = :s AND table_name = :t "
+            "AND data_type IN ('CLOB','BLOB','NCLOB','BFILE')",
+            s=schema, t=table_name,
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            has_lob = int(row[0]) > 0
+
+        cur.execute(
+            "SELECT COUNT(*) FROM all_tab_columns "
+            "WHERE owner = :s AND table_name = :t "
+            "AND data_type = 'LONG'",
+            s=schema, t=table_name,
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            has_long = int(row[0]) > 0
+
+    return TableProfile(
+        schema=schema,
+        table_name=table_name,
+        rows=rows,
+        size_mb=size_mb,
+        partitioned=partitioned,
+        has_lob=has_lob,
+        has_long=has_long,
+    )
 
 # ORA-31608: object/type/attribute/named not found (no indexes found for table)
 _ORA_NO_OBJECTS = 31608
@@ -436,6 +530,28 @@ def get_sequence_columns_via_triggers(
                 seen.add(key)
                 found.append(key)
     return found
+
+
+def supports_dbms_parallel_execute(conn: Any) -> bool:
+    """True iff the session has EXECUTE on DBMS_PARALLEL_EXECUTE.
+
+    Used by the strategy picker to downgrade ``chunked_staging`` to
+    ``parallel_dml`` when the priv is missing rather than fail at
+    runtime in the middle of phase 4.
+    """
+    sql = (
+        "SELECT 1 FROM all_tab_privs "
+        "WHERE table_name = 'DBMS_PARALLEL_EXECUTE' "
+        "AND privilege = 'EXECUTE' "
+        "AND (grantee = USER OR grantee IN "
+        "  (SELECT granted_role FROM user_role_privs))"
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            return cur.fetchone() is not None
+    except oracledb.DatabaseError:
+        return False
 
 
 def get_server_version(conn: Any) -> int:

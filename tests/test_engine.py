@@ -296,7 +296,7 @@ def test_engine_phase4_non_oracle_exception_propagates() -> None:
         with patched_introspect():
             with patch.object(
                 engine,  # type: ignore[union-attr]
-                "_insert_table",
+                "_dispatch_strategy",
                 side_effect=ValueError("unexpected programming error"),
             ):
                 with pytest.raises(ValueError, match="unexpected programming error"):

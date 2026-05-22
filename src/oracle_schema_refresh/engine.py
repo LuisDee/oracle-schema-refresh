@@ -432,8 +432,8 @@ class RefreshEngine:
             t_start = time.monotonic()
             try:
                 if not dry_run:
-                    self._insert_table(
-                        source_conn, target_conn, table, scn=scn, dblink=dblink_name
+                    self._dispatch_strategy(
+                        source_conn, target_conn, table, scn, dblink_name,
                     )
                 if dry_run:
                     rows_source = 0
@@ -745,6 +745,98 @@ class RefreshEngine:
                 cur.execute(sql, scn=scn)
             else:
                 cur.execute(sql)
+
+    def _dispatch_strategy(
+        self,
+        source_conn: Any,
+        target_conn: Any,
+        table: str,
+        scn: int | None,
+        dblink: str | None,
+    ) -> None:
+        """Profile the table, pick a strategy, and run it.
+
+        For ``config.strategy == "auto"`` (default), the profile drives
+        selection. Explicit names override. Always runs through the
+        strategy interface — including small tables (``direct_copy``)
+        so the engine has one code path for data movement.
+        """
+        from oracle_schema_refresh.strategy import (
+            StrategyContext,
+            pick_strategy,
+        )
+        from oracle_schema_refresh.strategy.chunked_staging import (
+            ChunkedStagingStrategy,
+        )
+        from oracle_schema_refresh.strategy.direct_copy import (
+            DirectCopyStrategy,
+        )
+        from oracle_schema_refresh.strategy.parallel_dml import (
+            ParallelDmlStrategy,
+        )
+
+        cfg = self._config
+        # Intersect source/target columns — we keep this on the engine
+        # (not the strategy) so all strategies see the same column shape
+        # and a missing-column failure mode lives in one place.
+        source_cols = introspect.get_table_columns(
+            source_conn, cfg.source_schema, table
+        )
+        target_cols = introspect.get_table_columns(
+            target_conn, cfg.target_schema, table
+        )
+        source_set = set(source_cols)
+        common = [c for c in target_cols if c in source_set]
+        if not common:
+            raise ValueError(
+                f"No overlapping columns between source and target for table {table!r}"
+            )
+
+        profile = introspect.get_table_profile(
+            source_conn, cfg.source_schema, table
+        )
+        supports_dpe = introspect.supports_dbms_parallel_execute(target_conn)
+        strategy_name = pick_strategy(
+            profile,
+            supports_dpe=supports_dpe,
+            override=cfg.strategy,
+        )
+        log.info(
+            "strategy_chosen",
+            table=table,
+            strategy=strategy_name,
+            rows=profile.rows,
+            size_mb=profile.size_mb,
+            partitioned=profile.partitioned,
+            has_lob=profile.has_lob,
+        )
+
+        impls = {
+            "direct_copy": DirectCopyStrategy,
+            "parallel_dml": ParallelDmlStrategy,
+            "chunked_staging": ChunkedStagingStrategy,
+        }
+        impl_cls = impls.get(strategy_name)
+        if impl_cls is None:
+            raise ValueError(
+                f"strategy {strategy_name!r} not yet implemented "
+                "(partition_exchange lands in Cut 3)"
+            )
+
+        ctx = StrategyContext(
+            source_conn=source_conn,
+            target_conn=target_conn,
+            source_schema=cfg.source_schema,
+            target_schema=cfg.target_schema,
+            table=table,
+            scn=scn,
+            dblink=dblink,
+            insert_hint=cfg.insert_hint,
+            max_parallel=cfg.max_parallel,
+            max_chunks_per_table=cfg.max_chunks_per_table,
+            columns=common,
+        )
+        impl_cls().load(ctx)
 
     def _disable_constraint(
         self, conn: Any, schema: str, table: str, constraint: str

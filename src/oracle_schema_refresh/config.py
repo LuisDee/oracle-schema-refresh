@@ -51,6 +51,12 @@ class RefreshConfig(BaseModel):
     )
     insert_hint: str = "/*+ APPEND */"
     call_timeout_seconds: int = 0
+    strategy: str = "auto"
+    """``auto`` (default), ``direct_copy``, ``parallel_dml``,
+    ``chunked_staging``, or ``partition_exchange``. ``auto`` picks per
+    table from the introspected profile; explicit names override."""
+    max_parallel: int = 4
+    max_chunks_per_table: int = 4
     dblink: str | None = None
     """Cross-host source link. ``"existing:NAME"`` to reuse a DBA-provisioned
     DB link; ``"session"`` to create a private link for the job's lifetime.
@@ -88,6 +94,28 @@ class RefreshConfig(BaseModel):
     def call_timeout_non_negative(cls, v: int) -> int:
         if v < 0:
             raise ValueError("call_timeout_seconds must be >= 0")
+        return v
+
+    @field_validator("max_parallel", "max_chunks_per_table")
+    @classmethod
+    def positive_parallelism(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("max_parallel / max_chunks_per_table must be >= 1")
+        return v
+
+    @field_validator("strategy")
+    @classmethod
+    def known_strategy(cls, v: str) -> str:
+        # Defer import — avoids a circular dependency at module load.
+        from oracle_schema_refresh.strategy.base import KNOWN_STRATEGIES
+
+        if v == "auto":
+            return v
+        if v not in KNOWN_STRATEGIES:
+            raise ValueError(
+                f"strategy must be 'auto' or one of {sorted(KNOWN_STRATEGIES)}; "
+                f"got {v!r}"
+            )
         return v
 
     @field_validator("dblink", mode="after")

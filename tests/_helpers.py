@@ -23,6 +23,15 @@ def make_mock_conn() -> MagicMock:
 
 # Sensible defaults that let RefreshEngine.run complete without hitting Oracle.
 # Each entry is patched as ``oracle_schema_refresh.engine.introspect.<name>``.
+def _default_profile() -> Any:
+    """Lazily build a TableProfile so this module imports cleanly even
+    when ``oracle_schema_refresh`` isn't on the path yet (it always is
+    by the time tests run, but defer-imports keep the file robust)."""
+    from oracle_schema_refresh.introspect import TableProfile
+
+    return TableProfile(schema="SRC", table_name="T1", rows=0, size_mb=0.0)
+
+
 _INTROSPECT_DEFAULTS: dict[str, Any] = {
     "table_exists": True,
     "discover_fk_parents": ["T1"],
@@ -33,6 +42,10 @@ _INTROSPECT_DEFAULTS: dict[str, Any] = {
     "get_sequence_columns_via_triggers": [],
     "get_server_version": 19,
     "get_table_row_count": 0,
+    # Cut 2 — profile defaults to a small table so auto-picker chooses
+    # ``direct_copy`` and existing tests keep passing unchanged.
+    "get_table_profile": _default_profile(),
+    "supports_dbms_parallel_execute": True,
 }
 
 
