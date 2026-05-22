@@ -101,6 +101,21 @@ def update_job_status(
         cur.execute(sql, status=status, error=error, job_id=job_id)
 
 
+def lock_job(conn: Any, job_id: str) -> bool:
+    """Acquire a row-level lock on the job using ``SELECT … FOR UPDATE
+    NOWAIT``. Returns True on success, False if the row doesn't exist.
+
+    Propagates ``oracledb.DatabaseError`` (ORA-00054) if another session
+    already holds the lock — the caller surfaces this as
+    "another worker is running this job" rather than silently waiting.
+    """
+    sql = "SELECT job_id FROM oracdb$jobs WHERE job_id = :job_id FOR UPDATE NOWAIT"
+    with conn.cursor() as cur:
+        cur.execute(sql, job_id=job_id)
+        row = cur.fetchone()
+    return row is not None
+
+
 def drop_job(conn: Any, job_id: str) -> None:
     """Delete the job row; the FK CASCADE on ``oracdb$tables`` clears
     the children too."""

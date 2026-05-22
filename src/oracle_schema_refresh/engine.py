@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -11,6 +12,8 @@ import structlog
 from oracle_schema_refresh import introspect
 from oracle_schema_refresh.config import OracleConnection, RefreshConfig
 from oracle_schema_refresh.endpoints import Endpoint
+
+CancelCheck = Callable[[], bool]
 
 log = structlog.get_logger()
 
@@ -80,11 +83,13 @@ class RefreshResult:
     constraints_reenabled: list[str] = field(default_factory=list)
     total_duration_seconds: float = 0.0
     scn: int | None = None
+    cancelled: bool = False
 
     def summary(self) -> dict[str, Any]:
         """Return a JSON-serialisable summary dict."""
         return {
             "success": self.success,
+            "cancelled": self.cancelled,
             "tables_requested": self.tables_requested,
             "table_order": self.table_order,
             "scn": self.scn,
@@ -161,11 +166,22 @@ class RefreshEngine:
     # Public API
     # ------------------------------------------------------------------
 
-    def run(self, dry_run: bool = False) -> RefreshResult:
+    def run(
+        self,
+        dry_run: bool = False,
+        check_cancellation: CancelCheck | None = None,
+    ) -> RefreshResult:
         """Execute a full refresh run.
 
         Args:
             dry_run: If True, log every action but execute no DDL/DML.
+            check_cancellation: Optional callable polled before every
+                table load in phase 4. Return True to ask the engine to
+                stop. Remaining tables are marked ``cancelled`` and the
+                result has ``cancelled=True``, ``success=False``. The
+                phase already in flight on the current table is allowed
+                to finish so the per-table commit/rollback decision is
+                consistent.
 
         Returns:
             RefreshResult with per-table outcomes and totals.
@@ -196,11 +212,19 @@ class RefreshEngine:
                     target_conn, self._source, self._config.dblink
                 ) as link_name:
                     result = self._execute(
-                        source_conn, target_conn, link_name, dry_run=dry_run
+                        source_conn,
+                        target_conn,
+                        link_name,
+                        dry_run=dry_run,
+                        check_cancellation=check_cancellation,
                     )
             else:
                 result = self._execute(
-                    source_conn, target_conn, None, dry_run=dry_run
+                    source_conn,
+                    target_conn,
+                    None,
+                    dry_run=dry_run,
+                    check_cancellation=check_cancellation,
                 )
         finally:
             if source_conn is not target_conn:
@@ -283,6 +307,7 @@ class RefreshEngine:
         target_conn: Any,
         dblink_name: str | None,
         dry_run: bool,
+        check_cancellation: CancelCheck | None = None,
     ) -> RefreshResult:
         """Run the 5-phase refresh.
 
@@ -386,7 +411,19 @@ class RefreshEngine:
                 self._truncate(target_conn, cfg.target_schema, table)
 
         # Insert in forward order (parents first)
+        cancelled = False
         for table in table_order:
+            if check_cancellation is not None and check_cancellation():
+                cancelled = True
+                log.warning("cancellation_requested", remaining_table=table)
+                # mark this and every remaining table as cancelled
+                for remaining in table_order[table_order.index(table):]:
+                    table_results.append(
+                        TableResult(table_name=remaining, status="cancelled")
+                    )
+                overall_success = False
+                break
+
             if not introspect.table_exists(source_conn, cfg.source_schema, table):
                 table_results.append(TableResult(table_name=table, status="skipped"))
                 log.warning("table_skipped_missing_source", table=table)
@@ -513,6 +550,7 @@ class RefreshEngine:
             constraints_disabled=disabled_constraints,
             constraints_reenabled=reenabled,
             scn=scn,
+            cancelled=cancelled,
         )
 
     # ------------------------------------------------------------------

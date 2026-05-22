@@ -13,6 +13,7 @@ from oracle_schema_refresh.state.job import (
     get_job,
     insert_job,
     list_jobs,
+    lock_job,
     update_job_status,
 )
 from oracle_schema_refresh.state.jobid import job_id_new
@@ -35,6 +36,7 @@ __all__ = [
     "insert_table_records",
     "job_id_new",
     "list_jobs",
+    "lock_job",
     "update_job_status",
     "update_table_record",
 ]
