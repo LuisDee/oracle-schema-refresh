@@ -19,6 +19,34 @@ _ORA_FK_VALIDATE_FAIL = 2298
 
 
 @dataclass
+class Plan:
+    """Output of ``RefreshEngine.plan()`` — what a run would do.
+
+    Pure introspection: no DDL, no DML, no commits. The CLI's ``plan``
+    subcommand persists this into ``oracdb$jobs``/``oracdb$tables`` and
+    returns the job id; ``run JOB_ID`` re-introspects to keep the
+    engine path simple (Cut 2 may cache more aggressively).
+    """
+
+    scn: int
+    server_version: int
+    tables_requested: list[str]
+    tables_resolved: list[str]
+    table_order: list[str]
+    cross_host: bool
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "scn": self.scn,
+            "server_version": self.server_version,
+            "tables_requested": self.tables_requested,
+            "tables_resolved": self.tables_resolved,
+            "table_order": self.table_order,
+            "cross_host": self.cross_host,
+        }
+
+
+@dataclass
 class TableResult:
     """Result for a single table refresh.
 
@@ -193,6 +221,57 @@ class RefreshEngine:
         if self._config.call_timeout_seconds > 0:
             # python-oracledb expects milliseconds.
             conn.call_timeout = self._config.call_timeout_seconds * 1000
+
+    # ------------------------------------------------------------------
+    # plan() — introspect-only path used by ``oracdb plan``
+    # ------------------------------------------------------------------
+
+    def plan(self) -> Plan:
+        """Run introspection only. Returns a :class:`Plan`; no DDL/DML.
+
+        Used by ``oracdb plan`` to capture the SCN and table order
+        before persisting state. Same connection model as ``run`` —
+        cross-host opens source + target sessions; same-instance uses
+        one. Connections are released before returning.
+        """
+        cfg = self._config
+        target_conn = self._target.connect()
+        self._apply_call_timeout(target_conn)
+        source_conn: Any
+        if self._is_cross_host:
+            source_conn = self._source.connect()
+            self._apply_call_timeout(source_conn)
+        else:
+            source_conn = target_conn
+
+        try:
+            scn = self._capture_scn(source_conn)
+            server_version = introspect.get_server_version(target_conn)
+
+            seed_tables = list(cfg.tables)
+            if cfg.auto_include_fk_parents:
+                resolved = introspect.discover_fk_parents(
+                    source_conn, cfg.source_schema, seed_tables
+                )
+            else:
+                resolved = list(seed_tables)
+            graph = introspect.build_dependency_graph(
+                source_conn, cfg.source_schema, resolved
+            )
+            table_order = introspect.topological_sort(graph)
+
+            return Plan(
+                scn=scn,
+                server_version=server_version,
+                tables_requested=seed_tables,
+                tables_resolved=resolved,
+                table_order=table_order,
+                cross_host=self._is_cross_host,
+            )
+        finally:
+            if source_conn is not target_conn:
+                source_conn.close()
+            target_conn.close()
 
     # ------------------------------------------------------------------
     # Internal orchestration
